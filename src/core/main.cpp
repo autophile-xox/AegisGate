@@ -13,9 +13,6 @@ namespace {
 
 int serve(const aegisgate::Config& config) {
     using namespace aegisgate;
-    if (config.rate_limit.redis) {
-        throw std::runtime_error("rate limiting is unavailable in this build");
-    }
     sigset_t signals;
     sigemptyset(&signals);
     sigaddset(&signals, SIGINT);
@@ -25,9 +22,10 @@ int serve(const aegisgate::Config& config) {
     }
     auto signal_fd = checked_fd(signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC), "signalfd");
     auto failure_fd = checked_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC), "supervisor eventfd");
+    auto limiter = config.rate_limit.redis ? std::make_unique<RateLimiter>(config.rate_limit) : nullptr;
     std::vector<std::unique_ptr<Worker>> workers;
     for (std::size_t i = 0; i < config.workers; ++i) {
-        workers.push_back(std::make_unique<Worker>(config, failure_fd.get(), i));
+        workers.push_back(std::make_unique<Worker>(config, failure_fd.get(), i, limiter.get()));
     }
     for (auto& worker : workers) {
         worker->start();

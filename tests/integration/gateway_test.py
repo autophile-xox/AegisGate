@@ -167,6 +167,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.fixed(b"health unavailable", status)
             return
         self.record()
+        if self.path == "/identity":
+            self.fixed(self.headers.get("X-Api-Key", "no key").encode())
+            return
         if self.server.delay:
             time.sleep(self.server.delay)
         if self.server.status != 200:
@@ -240,12 +243,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class ServerProcess:
-    def __init__(self, directory, config):
+    def __init__(self, directory, config, environment=None):
         self.log = directory / "gateway.log"
         config_path = directory / "gateway.conf"
         config_path.write_text(config, encoding="ascii")
         with self.log.open("w") as output:
-            self.process = subprocess.Popen([BINARY, config_path], stdout=output, stderr=output)
+            self.process = subprocess.Popen([BINARY, config_path], stdout=output, stderr=output,
+                                            env=environment)
 
     def ready(self):
         log = self.log.read_text()

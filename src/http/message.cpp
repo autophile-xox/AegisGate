@@ -352,7 +352,20 @@ int Message::on_body(const char* bytes, std::size_t length) {
     return 0;
 }
 
-std::string Message::forward_headers(bool close) const {
+std::optional<std::string_view> Message::unique_header(std::string_view lowercase) const {
+    std::optional<std::string_view> result;
+    for (const auto& [name, value] : headers_) {
+        if (name == lowercase) {
+            if (result) {
+                return std::nullopt;
+            }
+            result = trim(value);
+        }
+    }
+    return result;
+}
+
+std::string Message::forward_headers(bool close, bool strip_api_key) const {
     std::string output;
     if (type_ == HTTP_REQUEST) {
         output.append(llhttp_method_name(static_cast<llhttp_method_t>(parser_.method)));
@@ -362,7 +375,8 @@ std::string Message::forward_headers(bool close) const {
         output.append(reason_).append("\r\n");
     }
     for (const auto& [name, value] : headers_) {
-        if (!name.empty() && !hop_header(name) && !framing_header(name) &&
+        if (!name.empty() && !(strip_api_key && name == "x-api-key") &&
+            !hop_header(name) && !framing_header(name) &&
             !std::ranges::binary_search(connection_options_, name)) {
             output.append(name).append(":").append(trim(value)).append("\r\n");
         }
@@ -399,10 +413,14 @@ void Message::append_body(std::string& output) const {
     }
 }
 
-std::string error_response(int status) {
+std::string error_response(int status, std::string_view rate_reason) {
     const auto* reason = llhttp_status_name(static_cast<llhttp_status_t>(status));
-    return "HTTP/1.1 " + std::to_string(status) + " " + reason +
-           "\r\nContent-Length:0\r\nConnection:close\r\n\r\n";
+    auto output = "HTTP/1.1 " + std::to_string(status) + " " + reason +
+                  "\r\nContent-Length:0\r\nConnection:close\r\n";
+    if (!rate_reason.empty()) {
+        output.append("X-AegisGate-Rate-Limit: ").append(rate_reason).append("\r\n");
+    }
+    return output + "\r\n";
 }
 
 }  // namespace aegisgate::http

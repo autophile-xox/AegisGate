@@ -1,0 +1,7 @@
+#pragma once
+
+#include <string_view>
+
+namespace aegisgate {
+inline constexpr std::string_view reservation_script = R"lua(@RESERVATION_LUA@)lua";
+}

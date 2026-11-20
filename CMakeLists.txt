@@ -10,9 +10,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(AEGISGATE_SANITIZERS "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(AEGISGATE_TSAN "Build with ThreadSanitizer" OFF)
+if(AEGISGATE_SANITIZERS AND AEGISGATE_TSAN)
+    message(FATAL_ERROR "Use separate configurations for ASan/UBSan and TSan")
+endif()
 if(AEGISGATE_SANITIZERS)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
     add_link_options(-fsanitize=address,undefined)
+endif()
+if(AEGISGATE_TSAN)
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
 endif()
 
 include(FetchContent)
@@ -27,6 +35,25 @@ FetchContent_MakeAvailable(llhttp)
 target_compile_options(llhttp_static PRIVATE -fexceptions)
 find_package(Threads REQUIRED)
 
+set(DISABLE_TESTS ON CACHE BOOL "Skip hiredis upstream tests" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared dependencies" FORCE)
+FetchContent_Declare(hiredis
+    URL https://codeload.github.com/redis/hiredis/tar.gz/refs/tags/v1.3.0
+    URL_HASH SHA256=25cee4500f359cf5cad3b51ed62059aadfc0939b05150c1f19c7e2829123631c
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SYSTEM
+)
+FetchContent_MakeAvailable(hiredis)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS redis/reserve.lua)
+file(READ redis/reserve.lua RESERVATION_LUA)
+configure_file(src/rate_limit/reservation_script.hpp.in
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/reservation_script.hpp" @ONLY)
+
+add_library(aegisgate_rate STATIC src/rate_limit/limiter.cpp src/rate_limit/redis.cpp)
+target_include_directories(aegisgate_rate PUBLIC include PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(aegisgate_rate PRIVATE hiredis Threads::Threads)
+target_compile_options(aegisgate_rate PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+
 add_library(aegisgate_core STATIC src/core/config.cpp src/http/message.cpp src/routing/balancer.cpp
     src/resilience/circuit_breaker.cpp)
 target_include_directories(aegisgate_core PUBLIC include)
@@ -34,7 +61,7 @@ target_link_libraries(aegisgate_core PUBLIC llhttp::llhttp)
 target_compile_options(aegisgate_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
 add_library(aegisgate_reactor STATIC src/network/worker.cpp src/network/health.cpp)
-target_link_libraries(aegisgate_reactor PUBLIC aegisgate_core Threads::Threads)
+target_link_libraries(aegisgate_reactor PUBLIC aegisgate_core aegisgate_rate Threads::Threads)
 target_compile_options(aegisgate_reactor PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
 add_executable(aegisgate src/core/main.cpp)
@@ -56,6 +83,17 @@ if(BUILD_TESTING)
     include(GoogleTest)
     gtest_discover_tests(aegisgate_unit DISCOVERY_MODE PRE_TEST)
     find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+    find_program(AEGISGATE_REDIS_SERVER redis-server)
+    find_program(AEGISGATE_REDIS_CLI redis-cli)
+    if(AEGISGATE_REDIS_SERVER AND AEGISGATE_REDIS_CLI)
+        add_test(NAME redis_reservations COMMAND Python3::Interpreter
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/redis_test.py" -v LuaTests)
+        set_tests_properties(redis_reservations PROPERTIES TIMEOUT 45)
+        add_test(NAME rate_limit_integration COMMAND Python3::Interpreter
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/redis_test.py"
+            --gateway $<TARGET_FILE:aegisgate> -v RateTests)
+        set_tests_properties(rate_limit_integration PROPERTIES TIMEOUT 75)
+    endif()
     set(integration_suite "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/gateway_test.py")
     add_test(NAME gateway_integration COMMAND Python3::Interpreter
         "${integration_suite}" $<TARGET_FILE:aegisgate> -v)

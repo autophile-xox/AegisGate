@@ -86,8 +86,8 @@ Worker::Client::Client(Fd fd, const Config& config)
     : socket(std::move(fd)), request(HTTP_REQUEST, config.header_bytes, config.body_bytes),
       response(HTTP_RESPONSE, config.header_bytes, config.body_bytes) {}
 
-Worker::Worker(const Config& config, int failure_event, std::size_t worker_id)
-    : config_(config), failure_event_(failure_event), worker_id_(worker_id),
+Worker::Worker(const Config& config, int failure_event, std::size_t worker_id, RateLimiter* limiter)
+    : config_(config), failure_event_(failure_event), worker_id_(worker_id), limiter_(limiter),
       epoll_(checked_fd(epoll_create1(EPOLL_CLOEXEC), "epoll_create1")),
       wakeup_(checked_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC), "worker eventfd")),
       listener_(open_listener(config.listener)), balancer_(config, worker_id + 1) {
@@ -216,7 +216,7 @@ void Worker::accept_clients() {
 
 bool Worker::can_read_client(const Client& client) const {
     return !client.terminal && !client.request.complete() && !client.upload_cancelled &&
-           !client.pending && client.input.empty() &&
+           !client.pending && !client.rate_route && client.input.empty() &&
            client.to_upstream.size() + framing_room < config_.stream_buffer_bytes;
 }
 
@@ -281,7 +281,7 @@ void Worker::read_client(Token token, Client& client) {
 
 void Worker::pump_request(Token token, Client& client) {
     // One span can finish the headers and leave a partial body in the receive buffer.
-    for (int span = 0; span < 2 && !client.input.empty() && !client.pending &&
+    for (int span = 0; span < 2 && !client.input.empty() && !client.pending && !client.rate_route &&
          !client.terminal && !client.request.complete() && !client.upload_cancelled; ++span) {
         const auto remaining = config_.stream_buffer_bytes - client.to_upstream.size();
         if (remaining <= framing_room) {
@@ -298,34 +298,60 @@ void Worker::pump_request(Token token, Client& client) {
             fail(client, client.request.error_status());
             return;
         }
+        const Route* route = nullptr;
         if (!had_headers && client.request.has_headers()) {
             client.header_deadline = never;
-            const auto group = config_.route(client.request.host(), client.request.target());
-            if (!group) {
+            route = config_.match_route(client.request.host(), client.request.target());
+            if (!route) {
                 fail(client, 404);
-                return;
-            }
-            const auto backend = choose_backend(*group);
-            if (!backend) {
-                fail(client, 503);
                 return;
             }
             client.engaged = true;
             ++engaged_;
-            client.backend = *backend;
             client.close_after = !client.request.keep_alive();
-            client.exchange_deadline = now_ + config_.response_timeout;
             client.response.reset(client.request.is_head());
-            client.to_upstream.append(client.request.forward_headers(false),
+            client.to_upstream.append(client.request.forward_headers(false, !config_.rate_limit.tenants.empty()),
                                       config_.stream_buffer_bytes);
-            admit(token, client);
-            if (client.terminal) {
-                return;
-            }
         }
         if (client.request.has_headers()) {
             client.to_upstream.append_body(client.request, consumed, config_.stream_buffer_bytes);
         }
+        if (route && limiter_) {
+            client.rate_route = route;
+            client.rate_deadline = now_ + config_.rate_limit.wait;
+            check_rate(token, client);
+        } else if (route) {
+            start_upstream(token, client, *route);
+        }
+    }
+}
+
+void Worker::start_upstream(Token token, Client& client, const Route& route) {
+    const auto backend = choose_backend(route.group);
+    if (!backend) {
+        fail(client, 503);
+        return;
+    }
+    client.backend = *backend;
+    client.exchange_deadline = now_ + config_.response_timeout;
+    admit(token, client);
+}
+
+void Worker::check_rate(Token token, Client& client) {
+    const auto* route = client.rate_route;
+    const auto result = limiter_->admit(*route, client.request.unique_header("x-api-key"));
+    if (result == RateDecision::pending && now_ < client.rate_deadline) {
+        client.rate_retry = std::min(now_ + std::chrono::milliseconds(1), client.rate_deadline);
+        return;
+    }
+    client.rate_route = nullptr;
+    client.rate_retry = client.rate_deadline = never;
+    if (result == RateDecision::allow) {
+        start_upstream(token, client, *route);
+    } else {
+        const auto status = result == RateDecision::exhausted ? 429 :
+                            result == RateDecision::unauthorized ? 401 : 503;
+        fail(client, status, AttemptOutcome::cancelled, name(result));
     }
 }
 
@@ -437,10 +463,12 @@ void Worker::finish_response(Client& client, bool reusable) {
     client.terminal = true;
 }
 
-void Worker::fail(Client& client, int status, AttemptOutcome outcome) {
+void Worker::fail(Client& client, int status, AttemptOutcome outcome, std::string_view rate_reason) {
     account_attempt(client, outcome);
     release(client, false);
     client.exchange_deadline = client.header_deadline = never;
+    client.rate_route = nullptr;
+    client.rate_retry = client.rate_deadline = never;
     client.to_upstream.clear();
     if (client.response_sent) {
         client.dead = true;
@@ -452,7 +480,7 @@ void Worker::fail(Client& client, int status, AttemptOutcome outcome) {
     }
     client.terminal = client.close_after = true;
     client.output.clear();
-    client.output.append(http::error_response(status), config_.stream_buffer_bytes);
+    client.output.append(http::error_response(status, rate_reason), config_.stream_buffer_bytes);
 }
 
 void Worker::clear_exchange(Client& client) {
@@ -536,7 +564,8 @@ void Worker::settle(Token token) {
 
 void Worker::update_deadline(Token token, Client& client, Time connect_deadline) {
     const auto deadline = std::min({client.header_deadline, client.read_deadline,
-        client.write_deadline, client.exchange_deadline, connect_deadline, client.linger_deadline});
+        client.write_deadline, client.exchange_deadline, connect_deadline, client.linger_deadline,
+        client.rate_retry});
     if (client.timer) {
         if ((*client.timer)->first == deadline) {
             return;
@@ -564,7 +593,10 @@ bool Worker::expire_client(Token token) {
     if (!client.timer || (*client.timer)->first > now_) {
         return false;
     }
-    if (client.linger_deadline <= now_ || client.write_deadline <= now_) {
+    if (client.rate_route && client.rate_retry <= now_) {
+        check_rate(token, client);
+        pump_request(token, client);
+    } else if (client.linger_deadline <= now_ || client.write_deadline <= now_) {
         client.dead = true;
     } else if (client.header_deadline <= now_ || client.read_deadline <= now_) {
         if (client.request.started()) {

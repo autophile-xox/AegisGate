@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,7 +40,8 @@ public:
     [[nodiscard]] std::string_view host() const { return host_; }
     [[nodiscard]] bool started() const { return started_; }
 
-    [[nodiscard]] std::string forward_headers(bool close) const;
+    [[nodiscard]] std::optional<std::string_view> unique_header(std::string_view lowercase) const;
+    [[nodiscard]] std::string forward_headers(bool close, bool strip_api_key = false) const;
     void append_body(std::string& output) const;
 
 private:
@@ -79,6 +81,6 @@ private:
     std::vector<std::string> connection_options_;
 };
 
-[[nodiscard]] std::string error_response(int status);
+[[nodiscard]] std::string error_response(int status, std::string_view rate_reason = {});
 
 }  // namespace aegisgate::http
