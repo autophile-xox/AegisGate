@@ -1,13 +1,15 @@
 # AegisGate
 
-AegisGate is a Linux C++20 reverse proxy for routing HTTP/1.1 requests by host and path. It reuses backend connections, streams message bodies through bounded buffers, and steers traffic around slower or unhealthy backends.
+AegisGate is a Linux C++20 reverse proxy for routing HTTP/1.1 requests by host and path. It streams HTTP bodies through bounded buffers, steers traffic around slower or unhealthy backends, and shares rate limits across replicas through Redis.
 
 ~~~mermaid
 flowchart LR
     C[HTTP/1.1 clients] --> L[Worker listeners with SO_REUSEPORT]
     L --> E[One epoll reactor per worker]
     E --> P[llhttp parsing and route selection]
-    P --> B[Eligible backend group]
+    P --> R[Local quota admission]
+    D[Redis Lua reservations] --> R
+    R --> B[Eligible backend group]
     H[Active HTTP probes] --> B
     B --> Q[Worker-local backend pools]
     Q --> A[Backend A]
@@ -18,7 +20,7 @@ flowchart LR
 
 ## Build and run
 
-Use Linux or WSL2 with a C++20 compiler, CMake 3.25 or newer, and Python 3.10 or newer for integration tests. CMake downloads checksum-pinned llhttp 9.4.4 and GoogleTest 1.16.0. [llhttp documentation](https://github.com/nodejs/llhttp#readme), [GoogleTest release](https://github.com/google/googletest/releases/tag/v1.16.0)
+Use Linux or WSL2 with a C++20 compiler, CMake 3.25 or newer, and Python 3.10 or newer for integration tests. CMake downloads checksum-pinned llhttp 9.4.4, hiredis 1.3.0, and GoogleTest 1.16.0. [llhttp](https://github.com/nodejs/llhttp#readme) · [hiredis](https://github.com/redis/hiredis/tree/v1.3.0) · [GoogleTest](https://github.com/google/googletest/releases/tag/v1.16.0)
 
 ~~~bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -84,6 +86,26 @@ The single-backend configuration keeps both the breaker and active checks disabl
 
 Clients use plaintext HTTP/1.1 with origin-form targets. HTTP/1.0 backend responses are supported, with each connection retired after the exchange. Close-delimited responses are re-encoded as chunked downstream. TLS, protocol upgrades, CONNECT tunnels, informational responses, and Expect negotiation are outside M1. [HTTP/1.1 message framing](https://www.rfc-editor.org/rfc/rfc9112.html)
 
+## Distributed rate limiting
+
+Redis can authorize global, per-tenant, and per-route quotas. Each process leases batches from Redis via Lua and shares its local ledger across workers. A dedicated thread performs all Redis operations. Workers check every applicable scope before spending tokens, and use short reactor timer retries when refills are pending. Trusted tenant API keys come from environment variables.
+
+Exhausted quotas return `429`. Redis failures default to fail-closed with `503` after cached authorizations are spent or expire. The rate-limiter configuration also supports bounded fallback and explicit fail-open. [Configuration, failure policy, and consistency details](docs/rate-limiting.md)
+
+For a demo, start the origin on port 9000 and a local Redis process in separate terminals, then launch the gateway with a generated demo API key.
+
+~~~bash
+redis-server --bind 127.0.0.1 --port 6381 --save "" --appendonly no
+~~~
+
+~~~bash
+export AEGISGATE_DEMO_TENANT_KEY="$(openssl rand -hex 24)"
+./build/aegisgate config/rate-limited.conf &
+curl --retry 3 --retry-connrefused -i -H "X-API-Key: $AEGISGATE_DEMO_TENANT_KEY" http://127.0.0.1:8080/api
+~~~
+
+[Rate-limited example configuration](config/rate-limited.conf)
+
 ## Verification and benchmarks
 
 CTest runs GoogleTest cases, a real-socket Python integration suite, and a separate binary-echo test that forces short reads, short writes, `EINTR`, and `EAGAIN`. The sanitizer build runs the same tests.
@@ -147,4 +169,4 @@ taskset -c 8,10 python3 benchmarks/m2_resilience.py \
   --fast-cpu 2 --gateway-cpu 4 --slow-cpu 6
 ~~~
 
-Redis rate limits are planned for M3. Exported metrics, deployment, CI, and expanded benchmarking follow in M4. [Project progress](PROJECT_PROGRESS.md)
+Redis and the simulator are included in the reproducible [M3 benchmark](docs/rate-limiting.md#verification-and-measurement). Exported metrics, deployment, CI, and expanded benchmarking follow in M4. [Project progress](PROJECT_PROGRESS.md)
