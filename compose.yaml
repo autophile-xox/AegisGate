@@ -1,0 +1,110 @@
+x-gateway: &gateway
+  build: .
+  image: aegisgate:stage1
+  environment:
+    AEGISGATE_DEMO_TENANT_KEY: ${AEGISGATE_DEMO_TENANT_KEY:?Set AEGISGATE_DEMO_TENANT_KEY for the demo}
+  depends_on:
+    redis:
+      condition: service_healthy
+    fast:
+      condition: service_healthy
+    slow:
+      condition: service_healthy
+  networks: [demo]
+  healthcheck:
+    test: [CMD, curl, --fail, --silent, --output, /dev/null, http://127.0.0.1:9091/healthz]
+    interval: 2s
+    timeout: 2s
+    retries: 10
+
+x-origin: &origin
+  build: ./upstream-simulator
+  image: aegisgate-simulator:stage1
+  healthcheck:
+    test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:9000/health]
+    interval: 2s
+    timeout: 2s
+    retries: 10
+
+services:
+  gateway-a:
+    <<: *gateway
+    ports: ["127.0.0.1:8080:8080"]
+  gateway-b:
+    <<: *gateway
+    ports: ["127.0.0.1:8081:8080"]
+  fast:
+    <<: *origin
+    command: [-name, fast, -listen, "0.0.0.0:9000", -control, "127.0.0.1:9100", -delay-ms, "1"]
+    networks:
+      demo:
+        ipv4_address: 172.29.45.11
+  slow:
+    <<: *origin
+    command: [-name, slow, -listen, "0.0.0.0:9000", -control, "127.0.0.1:9100", -delay-ms, "1"]
+    networks:
+      demo:
+        ipv4_address: 172.29.45.12
+  redis:
+    image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+    command: [redis-server, --appendonly, "yes", --maxmemory-policy, noeviction]
+    volumes: ["redis-data:/data"]
+    networks:
+      demo:
+        ipv4_address: 172.29.45.10
+    healthcheck:
+      test: [CMD, redis-cli, PING]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks: [demo]
+    depends_on:
+      gateway-a:
+        condition: service_healthy
+      gateway-b:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:9090/-/ready]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+  grafana:
+    image: grafana/grafana:12.1.0
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks: [demo]
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:3000/api/health]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+networks:
+  demo:
+    ipam:
+      config:
+        - subnet: 172.29.45.0/24
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:

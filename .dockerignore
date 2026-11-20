@@ -1,0 +1,8 @@
+.git
+.local
+resume_metrics.local.md
+.env
+.env.*
+build
+build-*
+**/__pycache__

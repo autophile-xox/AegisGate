@@ -40,6 +40,42 @@ std::string label(std::string_view name, std::string_view value) {
 }
 
 void type(std::ostream& out, std::string_view name, std::string_view kind) {
+    using Description = std::pair<std::string_view, std::string_view>;
+    static constexpr Description descriptions[]{
+        {"aegisgate_backend_active_requests", "Active application attempts per backend."},
+        {"aegisgate_backend_failures_total", "Backend attempt failures by reason."},
+        {"aegisgate_backend_healthy", "Worker-local active health eligibility (1 eligible, 0 unhealthy)."},
+        {"aegisgate_circuit_state", "Circuit state per backend and worker (0 closed, 1 open, 2 half-open)."},
+        {"aegisgate_circuit_transitions_total", "Circuit transitions grouped by their destination state."},
+        {"aegisgate_http_connections", "Accepted downstream TCP connections currently owned by workers."},
+        {"aegisgate_http_responses_total", "Complete HTTP responses written to downstream sockets by status."},
+        {"aegisgate_local_token_shortages_total", "Admission checks with at least one missing local quota token."},
+        {"aegisgate_pending_requests", "Requests currently queued for rate admission or upstream assignment."},
+        {"aegisgate_rate_rejections_total", "Requests rejected by the rate admission layer by reason."},
+        {"aegisgate_redis_commands_total", "Complete reservation commands submitted to Redis."},
+        {"aegisgate_redis_connected", "Last observed Redis transport state (1 connected, 0 disconnected)."},
+        {"aegisgate_redis_queue_depth", "Refill jobs currently queued for the Redis synchronizer."},
+        {"aegisgate_redis_reservation_duration_seconds", "Submitted Redis reservation operation duration."},
+        {"aegisgate_redis_reservations_total", "Reservation attempts by outcome, including transport failures."},
+        {"aegisgate_request_duration_seconds", "Time from parsing start to completed or cancelled exchange."},
+        {"aegisgate_requests_cancelled_total", "Started exchanges without a completely written response."},
+        {"aegisgate_requests_rejected_total", "Gateway-generated 4xx and admission 503 responses."},
+        {"aegisgate_requests_successful_total", "Completely written HTTP 2xx responses."},
+        {"aegisgate_requests_total", "Downstream exchanges started by the HTTP parser."},
+        {"aegisgate_route_duration_seconds", "Exchange duration grouped by configured host and path prefix."},
+        {"aegisgate_token_refills_total", "Valid Redis reservations that returned a nonempty grant."},
+        {"aegisgate_tokens_consumed_total", "Quota units consumed by lease or explicit failure policy."},
+        {"aegisgate_tokens_granted_total", "Quota tokens granted by valid Redis reservations."},
+        {"aegisgate_upstream_connections", "Active and idle pooled TCP sockets per backend."},
+        {"aegisgate_upstream_duration_seconds", "Time from backend assignment to validated non-5xx response."},
+        {"process_cpu_seconds_total", "Total process user and system CPU time in seconds."},
+        {"process_open_fds", "Number of file descriptors currently open by the process."},
+        {"process_resident_memory_bytes", "Resident memory size of the process in bytes."},
+    };
+    const auto description = std::ranges::find(descriptions, name, &Description::first);
+    if (description != std::end(descriptions)) {
+        out << "# HELP " << name << ' ' << description->second << '\n';
+    }
     out << "# TYPE " << name << ' ' << kind << '\n';
 }
 

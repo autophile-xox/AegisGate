@@ -3,3 +3,5 @@
 /resume_metrics.local.md
 /.local/benchmark-results/
 __pycache__/
+/.env
+/.env.*
