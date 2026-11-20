@@ -21,6 +21,7 @@ public:
 
     RedisConnection(const Endpoint& endpoint, int stop_fd);
     [[nodiscard]] Reservation reserve(const QuotaSettings& quota, std::size_t wanted, Time deadline);
+    [[nodiscard]] bool connected() const { return static_cast<bool>(socket_); }
 
 private:
     RateDecision connect(Time deadline);

@@ -6,6 +6,8 @@
 
 namespace aegisgate {
 
+struct RedisMetrics;
+
 enum class RateDecision {
     allow, unauthorized, exhausted, pending, timeout, disconnected, invalid, fallback_exhausted
 };
@@ -14,7 +16,7 @@ enum class RateDecision {
 
 class RateLimiter {
 public:
-    explicit RateLimiter(const RateSettings& settings);
+    explicit RateLimiter(const RateSettings& settings, RedisMetrics* metrics = nullptr);
     ~RateLimiter();
     RateLimiter(const RateLimiter&) = delete;
     RateLimiter& operator=(const RateLimiter&) = delete;

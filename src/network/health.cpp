@@ -159,6 +159,9 @@ void Worker::observe_health(std::size_t backend, bool success, std::string_view 
         }
     }
     if (previous != health.healthy) {
+        if (metrics_) {
+            metrics_->backend[backend].healthy.store(health.healthy, std::memory_order_relaxed);
+        }
         const auto tick = std::chrono::duration_cast<std::chrono::milliseconds>(now_.time_since_epoch());
         std::osyncstream(std::cerr) << "worker=" << worker_id_ << " backend=" << config_.backends[backend].name
             << " health=" << (previous ? "healthy->unhealthy" : "unhealthy->healthy")

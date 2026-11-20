@@ -156,14 +156,16 @@ class RateTests(unittest.TestCase):
         self.addCleanup(server.close)
         return server
 
-    def start(self, redis_port, quotas, *, extra="", env=None, workers=3):
+    def start(self, redis_port, quotas, *, extra="", env=None, workers=3, routes=None):
         port = free_port()
         directory = tempfile.TemporaryDirectory(prefix="aegisgate-rate-")
         self.addCleanup(directory.cleanup)
         config = (
             f"listen {HOST} {port}\nworkers {workers}\n"
             f"backend origin {HOST} {self.backend.server_port} 64 32 64\n"
-            "route * / origin\nroute * /limited origin\nroute * /another origin\nroute * /third origin\n"
+            + (routes or "route * / origin\nroute * /limited origin\n"
+                         "route * /another origin\nroute * /third origin\n")
+            +
             f"redis {HOST} {redis_port}\nrate_diagnostics on\n"
             + ("" if "rate_lease_ms " in extra else "rate_lease_ms 5000\n")
             + extra + quotas
@@ -358,6 +360,59 @@ class RateTests(unittest.TestCase):
         started = time.monotonic()
         process.close()
         self.assertLess(time.monotonic() - started, 1.2)
+
+    def test_combined_http_resilience_quota_and_metrics(self):
+        redis = self.redis()
+        bad = gateway.Backend("bad")
+        self.addCleanup(bad.close)
+        bad.status = 503
+        identity = secrets.token_urlsafe()
+        headers = f"X-API-Key: {identity}\r\n".encode()
+        monitor = free_port()
+        port, _ = self.start(
+            redis.port,
+            "quota global 20 0 4\nquota tenant team 20 0 4\n"
+            "tenant_key team AEGISGATE_TEST_STAGE_ONE_KEY\nquota route * /limited 2 0 2\n",
+            workers=1, env=dict(os.environ, AEGISGATE_TEST_STAGE_ONE_KEY=identity),
+            routes="group all peak_ewma bad origin\nroute * / all\nroute * /limited all\nroute * /bad bad\n",
+            extra=f"backend bad {HOST} {bad.server_port} 4 2 2\nmetrics_listen {HOST} {monitor}\n"
+                  "circuit_breaker on\ncircuit_min_samples 1\ncircuit_failure_percent 100\n"
+                  "circuit_cooldown_ms 750\ncircuit_recovery_successes 1\nhealth_interval_ms 25\n",
+        )
+        self.assertEqual(self.get(monitor, "/healthz")[0], 200)
+        self.assertEqual(self.get(port)[0], 401)
+        self.assertEqual(self.get(port, "/bad", headers)[0], 503)
+        with gateway.Wire(port) as connection:
+            connection.send(gateway.request("/echo", "POST",
+                            headers=headers + b"Transfer-Encoding: chunked\r\n")
+                            + b"4\r\ndata\r\n0\r\n\r\n")
+            self.assertEqual(connection.response()[2], b"data")
+            for path in ("/limited?opaque_request_label", "/limited"):
+                connection.send(gateway.request(path, headers=headers))
+                self.assertEqual(connection.response()[0], 200)
+            connection.send(gateway.request("/limited", headers=headers))
+            self.assertEqual(connection.response()[0], 429)
+        self.assertEqual(bad.requests, ["/bad"])
+        bad.status = 200
+        time.sleep(0.8)
+        self.assertEqual(self.get(port, "/bad", headers)[2], b"bad:/bad")
+        text = self.get(monitor, "/metrics")[2].decode()
+        for sample in (
+            "aegisgate_requests_total 7\n",
+            "aegisgate_requests_successful_total 4\n",
+            "aegisgate_requests_rejected_total 2\n",
+            'aegisgate_http_responses_total{status="429"} 1\n',
+            "aegisgate_request_duration_seconds_count 7\n",
+            'aegisgate_circuit_transitions_total{backend="bad",state="open"} 1\n',
+            'aegisgate_circuit_transitions_total{backend="bad",state="closed"} 1\n',
+            'aegisgate_backend_failures_total{backend="bad",reason="upstream_5xx"} 1\n',
+            'aegisgate_rate_rejections_total{reason="quota_exhausted"} 1\n',
+            'aegisgate_tokens_consumed_total{source="lease"} 12\n',
+            "aegisgate_redis_connected 1\n",
+        ):
+            self.assertIn(sample, text)
+        self.assertNotIn("opaque_request_label", text)
+        self.assertNotIn(identity, text)
 
 
 if __name__ == "__main__":

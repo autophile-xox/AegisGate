@@ -22,13 +22,19 @@ int serve(const aegisgate::Config& config) {
     }
     auto signal_fd = checked_fd(signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC), "signalfd");
     auto failure_fd = checked_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC), "supervisor eventfd");
-    auto limiter = config.rate_limit.redis ? std::make_unique<RateLimiter>(config.rate_limit) : nullptr;
+    auto metrics = config.metrics_listener ? std::make_unique<Metrics>(config) : nullptr;
+    auto limiter = config.rate_limit.redis ?
+        std::make_unique<RateLimiter>(config.rate_limit, metrics ? &metrics->redis : nullptr) : nullptr;
     std::vector<std::unique_ptr<Worker>> workers;
     for (std::size_t i = 0; i < config.workers; ++i) {
-        workers.push_back(std::make_unique<Worker>(config, failure_fd.get(), i, limiter.get()));
+        workers.push_back(std::make_unique<Worker>(config, failure_fd.get(), i, limiter.get(),
+                                                   metrics ? &metrics->worker(i) : nullptr));
     }
     for (auto& worker : workers) {
         worker->start();
+    }
+    if (metrics) {
+        metrics->set_ready(true);
     }
     std::cout << "AegisGate ready with " << workers.size() << " worker(s)\n" << std::flush;
 
@@ -38,6 +44,9 @@ int serve(const aegisgate::Config& config) {
         ready = poll(watched.data(), watched.size(), -1);
     } while (ready < 0 && errno == EINTR);
     check_syscall(ready, "supervisor poll");
+    if (metrics) {
+        metrics->set_ready(false);
+    }
     for (auto& worker : workers) {
         worker->stop();
     }

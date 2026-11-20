@@ -36,6 +36,7 @@ public:
     [[nodiscard]] int status() const { return status_; }
     [[nodiscard]] bool keep_alive() const { return keep_alive_; }
     [[nodiscard]] bool is_head() const { return parser_.method == HTTP_HEAD; }
+    [[nodiscard]] bool is_get() const { return parser_.method == HTTP_GET; }
     [[nodiscard]] std::string_view target() const { return target_; }
     [[nodiscard]] std::string_view host() const { return host_; }
     [[nodiscard]] bool started() const { return started_; }

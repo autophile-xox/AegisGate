@@ -4,6 +4,7 @@
 
 #include "aegisgate/config.hpp"
 #include "aegisgate/http/message.hpp"
+#include "aegisgate/metrics/metrics.hpp"
 #include "aegisgate/rate_limit/limiter.hpp"
 #include "aegisgate/resilience/circuit_breaker.hpp"
 #include "aegisgate/routing/balancer.hpp"
@@ -20,7 +21,8 @@ namespace aegisgate {
 
 class Worker {
 public:
-    Worker(const Config& config, int failure_event, std::size_t worker_id, RateLimiter* limiter);
+    Worker(const Config& config, int failure_event, std::size_t worker_id, RateLimiter* limiter,
+           WorkerMetrics* metrics);
     ~Worker();
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
@@ -77,6 +79,9 @@ private:
         Time rate_retry{never};
         Time rate_deadline{never};
         const Route* rate_route{};
+        const Route* metric_route{};
+        Time metric_started{never};
+        int metric_status{};
         Time attempt_started{never};
         Time response_headers_at{never};
         bool engaged{};
@@ -141,6 +146,8 @@ private:
     void pump_request(Token token, Client& client);
     void start_upstream(Token token, Client& client, const Route& route);
     void check_rate(Token token, Client& client);
+    void clear_rate_wait(Client& client);
+    void finish_metrics(Client& client, bool delivered);
     void read_response(Client& client, Upstream& upstream, bool hangup);
     void finish_response(Client& client, bool reusable);
     void fail(Client& client, int status, AttemptOutcome outcome = AttemptOutcome::cancelled,
@@ -177,6 +184,7 @@ private:
     const int failure_event_;
     const std::size_t worker_id_;
     RateLimiter* const limiter_;
+    WorkerMetrics* const metrics_;
     Fd epoll_;
     Fd wakeup_;
     WatchedFd listener_;

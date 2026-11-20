@@ -86,8 +86,10 @@ Worker::Client::Client(Fd fd, const Config& config)
     : socket(std::move(fd)), request(HTTP_REQUEST, config.header_bytes, config.body_bytes),
       response(HTTP_RESPONSE, config.header_bytes, config.body_bytes) {}
 
-Worker::Worker(const Config& config, int failure_event, std::size_t worker_id, RateLimiter* limiter)
+Worker::Worker(const Config& config, int failure_event, std::size_t worker_id, RateLimiter* limiter,
+               WorkerMetrics* metrics)
     : config_(config), failure_event_(failure_event), worker_id_(worker_id), limiter_(limiter),
+      metrics_(metrics),
       epoll_(checked_fd(epoll_create1(EPOLL_CLOEXEC), "epoll_create1")),
       wakeup_(checked_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC), "worker eventfd")),
       listener_(open_listener(config.listener)), balancer_(config, worker_id + 1) {
@@ -210,6 +212,9 @@ void Worker::accept_clients() {
         set_nodelay(fd.get());
         const auto token = next_token_++;
         clients_.try_emplace(token, std::move(fd), config_);
+        if (metrics_) {
+            metrics_->connections.store(clients_.size(), std::memory_order_relaxed);
+        }
         settle(token);
     }
 }
@@ -290,6 +295,10 @@ void Worker::pump_request(Token token, Client& client) {
         const auto had_headers = client.request.has_headers();
         if (!client.request.started()) {
             client.header_deadline = now_ + config_.header_timeout;
+            if (metrics_) {
+                metrics_->requests.fetch_add(1, std::memory_order_relaxed);
+                client.metric_started = now_;
+            }
         }
         const auto bytes = client.input.view().substr(0, remaining - framing_room);
         const auto consumed = client.request.consume(bytes);
@@ -306,6 +315,7 @@ void Worker::pump_request(Token token, Client& client) {
                 fail(client, 404);
                 return;
             }
+            client.metric_route = route;
             client.engaged = true;
             ++engaged_;
             client.close_after = !client.request.keep_alive();
@@ -341,18 +351,54 @@ void Worker::check_rate(Token token, Client& client) {
     const auto* route = client.rate_route;
     const auto result = limiter_->admit(*route, client.request.unique_header("x-api-key"));
     if (result == RateDecision::pending && now_ < client.rate_deadline) {
+        if (metrics_ && client.rate_retry == never) {
+            metrics_->refill_pending.fetch_add(1, std::memory_order_relaxed);
+        }
         client.rate_retry = std::min(now_ + std::chrono::milliseconds(1), client.rate_deadline);
         return;
     }
-    client.rate_route = nullptr;
-    client.rate_retry = client.rate_deadline = never;
+    clear_rate_wait(client);
     if (result == RateDecision::allow) {
         start_upstream(token, client, *route);
     } else {
+        if (metrics_) {
+            metrics_->rate_rejections[static_cast<std::size_t>(result)].fetch_add(1, std::memory_order_relaxed);
+        }
         const auto status = result == RateDecision::exhausted ? 429 :
                             result == RateDecision::unauthorized ? 401 : 503;
         fail(client, status, AttemptOutcome::cancelled, name(result));
     }
+}
+
+void Worker::clear_rate_wait(Client& client) {
+    if (metrics_ && client.rate_retry != never) {
+        metrics_->refill_pending.fetch_sub(1, std::memory_order_relaxed);
+    }
+    client.rate_route = nullptr;
+    client.rate_retry = client.rate_deadline = never;
+}
+
+void Worker::finish_metrics(Client& client, bool delivered) {
+    if (!metrics_ || client.metric_started == never) {
+        return;
+    }
+    const auto duration = now_ - client.metric_started;
+    metrics_->duration.observe(duration);
+    if (client.metric_route) {
+        const auto index = static_cast<std::size_t>(client.metric_route - config_.routes.data());
+        metrics_->route_duration[index].observe(duration);
+    }
+    if (delivered && client.metric_status >= 100 && client.metric_status < 600) {
+        metrics_->statuses[static_cast<std::size_t>(client.metric_status)].fetch_add(1, std::memory_order_relaxed);
+        if (client.metric_status >= 200 && client.metric_status < 300) {
+            metrics_->successful.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        metrics_->cancelled.fetch_add(1, std::memory_order_relaxed);
+    }
+    client.metric_started = never;
+    client.metric_route = nullptr;
+    client.metric_status = 0;
 }
 
 std::size_t Worker::response_read_size(const Client& client) const {
@@ -456,6 +502,7 @@ void Worker::read_response(Client& client, Upstream& upstream, bool hangup) {
 }
 
 void Worker::finish_response(Client& client, bool reusable) {
+    client.metric_status = client.response.status();
     account_attempt(client, client.response.status() < 500 ? AttemptOutcome::success
                                                            : AttemptOutcome::upstream_5xx);
     release(client, reusable);
@@ -467,8 +514,7 @@ void Worker::fail(Client& client, int status, AttemptOutcome outcome, std::strin
     account_attempt(client, outcome);
     release(client, false);
     client.exchange_deadline = client.header_deadline = never;
-    client.rate_route = nullptr;
-    client.rate_retry = client.rate_deadline = never;
+    clear_rate_wait(client);
     client.to_upstream.clear();
     if (client.response_sent) {
         client.dead = true;
@@ -477,6 +523,10 @@ void Worker::fail(Client& client, int status, AttemptOutcome outcome, std::strin
     if (!client.engaged) {
         client.engaged = true;
         ++engaged_;
+    }
+    client.metric_status = status;
+    if (metrics_ && ((status >= 400 && status < 500) || status == 503)) {
+        metrics_->rejected.fetch_add(1, std::memory_order_relaxed);
     }
     client.terminal = client.close_after = true;
     client.output.clear();
@@ -498,6 +548,7 @@ void Worker::settle(Token token) {
     auto iterator = clients_.find(token);
     auto& client = iterator->second;
     if (!client.dead && client.terminal && client.output.empty() && client.linger_deadline == never) {
+        finish_metrics(client, true);
         if (draining_ || client.close_after) {
             // Send FIN after the response, then discard unread inbound data for a short period.
             // Closing with unread TCP data can reset the connection and hide the error response.
@@ -514,6 +565,8 @@ void Worker::settle(Token token) {
         }
     }
     if (client.dead) {
+        finish_metrics(client, false);
+        clear_rate_wait(client);
         release(client, false);
         if (client.timer) {
             deadlines_.erase(*client.timer);
@@ -522,6 +575,9 @@ void Worker::settle(Token token) {
             --engaged_;
         }
         clients_.erase(iterator);
+        if (metrics_) {
+            metrics_->connections.store(clients_.size(), std::memory_order_relaxed);
+        }
         return;
     }
     std::uint32_t desired = client.peer_fin ? 0U : EPOLLRDHUP;
@@ -674,6 +730,9 @@ void Worker::admit(Token token, Client& client) {
         assign(token, client);
     } else if (pool.pending.size() < config_.backends[client.backend].pending) {
         client.pending = pool.pending.insert(pool.pending.end(), token);
+        if (metrics_) {
+            metrics_->upstream_pending.fetch_add(1, std::memory_order_relaxed);
+        }
         schedule(client.backend);
     } else {
         fail(client, 503);
@@ -690,6 +749,9 @@ void Worker::assign(Token token, Client& client) {
     }
     log_transition(client.backend, previous, "cooldown_elapsed");
     balancer_.begin(client.backend);
+    if (metrics_) {
+        metrics_->backend[client.backend].active.fetch_add(1, std::memory_order_relaxed);
+    }
     client.attempt_started = now_;
     client.response_headers_at = never;
     if (!pool.idle.empty()) {
@@ -697,6 +759,9 @@ void Worker::assign(Token token, Client& client) {
         auto& upstream = upstreams_.at(idle);
         if (idle_socket_usable(upstream.socket.fd.get())) {
             pool.idle.pop_back();
+            if (metrics_) {
+                metrics_->backend[client.backend].idle.store(pool.idle.size(), std::memory_order_relaxed);
+            }
             upstream.idle.reset();
             upstream.client = token;
             client.upstream = idle;
@@ -724,12 +789,26 @@ void Worker::assign(Token token, Client& client) {
     const auto upstream = next_token_++;
     upstreams_.try_emplace(upstream, std::move(fd), client.backend, token, connect_deadline);
     ++pool.count;
+    if (metrics_) {
+        metrics_->backend[client.backend].connections.store(pool.count, std::memory_order_relaxed);
+    }
     client.upstream = upstream;
 }
 
 void Worker::account_attempt(Client& client, AttemptOutcome outcome) {
     if (!client.permit) {
         return;
+    }
+    if (metrics_) {
+        auto& backend = metrics_->backend[client.backend];
+        backend.active.fetch_sub(1, std::memory_order_relaxed);
+        if (outcome == AttemptOutcome::success) {
+            backend.duration.observe(now_ - client.attempt_started);
+        } else if (outcome != AttemptOutcome::cancelled) {
+            const auto index = static_cast<std::size_t>(outcome) -
+                               static_cast<std::size_t>(AttemptOutcome::upstream_5xx);
+            backend.failures[index].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     std::optional<Clock::duration> latency;
     if (outcome == AttemptOutcome::success) {
@@ -753,6 +832,12 @@ void Worker::account_attempt(Client& client, AttemptOutcome outcome) {
 void Worker::log_transition(std::size_t backend, CircuitState previous, std::string_view reason) {
     const auto current = pools_[backend].breaker.state();
     if (current != previous) {
+        if (metrics_) {
+            auto& data = metrics_->backend[backend];
+            const auto index = static_cast<std::size_t>(current);
+            data.circuit.store(index, std::memory_order_relaxed);
+            data.transitions[index].fetch_add(1, std::memory_order_relaxed);
+        }
         const auto tick = std::chrono::duration_cast<std::chrono::milliseconds>(now_.time_since_epoch());
         std::osyncstream(std::cerr) << "worker=" << worker_id_ << " backend=" << config_.backends[backend].name
             << " circuit=" << name(previous) << "->" << name(current)
@@ -766,6 +851,9 @@ void Worker::release(Client& client, bool reusable) {
     if (client.pending) {
         pool.pending.erase(*client.pending);
         client.pending.reset();
+        if (metrics_) {
+            metrics_->upstream_pending.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
     if (client.upstream == 0) {
         return;
@@ -776,6 +864,9 @@ void Worker::release(Client& client, bool reusable) {
         idle_socket_usable(upstream.socket.fd.get())) {
         upstream.client = 0;
         upstream.idle = pool.idle.insert(pool.idle.end(), token);
+        if (metrics_) {
+            metrics_->backend[client.backend].idle.store(pool.idle.size(), std::memory_order_relaxed);
+        }
         upstream.socket.watch(epoll_.get(), token, read_events);
     } else {
         retire(token);
@@ -791,6 +882,11 @@ void Worker::retire(Token token) {
         pool.idle.erase(*iterator->second.idle);
     }
     --pool.count;
+    if (metrics_) {
+        auto& data = metrics_->backend[backend];
+        data.connections.store(pool.count, std::memory_order_relaxed);
+        data.idle.store(pool.idle.size(), std::memory_order_relaxed);
+    }
     upstreams_.erase(iterator);
     schedule(backend);
 }
@@ -815,6 +911,9 @@ void Worker::dispatch() {
         }
         const auto token = pool.pending.front();
         pool.pending.pop_front();
+        if (metrics_) {
+            metrics_->upstream_pending.fetch_sub(1, std::memory_order_relaxed);
+        }
         auto& client = clients_.at(token);
         client.pending.reset();
         if (client.exchange_deadline <= now_) {

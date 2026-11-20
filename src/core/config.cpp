@@ -264,6 +264,11 @@ Config load_config(const std::filesystem::path& path) {
                 config.listener = endpoint(parts[1], parts[2]);
                 continue;
             }
+            if (key == "metrics_listen") {
+                require_count(2);
+                config.metrics_listener = endpoint(parts[1], parts[2]);
+                continue;
+            }
             if (key == "redis") {
                 require_count(2);
                 rate_limit.redis = endpoint(parts[1], parts[2]);

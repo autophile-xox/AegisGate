@@ -1,4 +1,5 @@
 #include "aegisgate/rate_limit/limiter.hpp"
+#include "aegisgate/metrics/metrics.hpp"
 #include "redis.hpp"
 
 #include <algorithm>
@@ -82,8 +83,8 @@ std::string_view name(RateDecision decision) {
 
 class RateLimiter::State {
 public:
-    explicit State(const RateSettings& settings)
-        : config_(settings), queue_(settings.queue),
+    explicit State(const RateSettings& settings, RedisMetrics* metrics)
+        : config_(settings), metrics_(metrics), queue_(settings.queue),
           ready_(checked_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC), "rate queue eventfd")),
           stop_(checked_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC), "rate stop eventfd")) {
         for (std::size_t index = 0; index < config_.quotas.size(); ++index) {
@@ -153,6 +154,7 @@ private:
         const auto now = Clock::now();
         std::array<Source, 3> sources{};
         auto blocked = RateDecision::allow;
+        bool local_shortage = false;
         for (std::size_t i = 0; i < count; ++i) {
             auto& pool = *pools_[ids[i]];
             pool.expire(now);
@@ -161,6 +163,7 @@ private:
                 sources[i] = Source::lease;
                 continue;
             }
+            local_shortage = true;
             auto reason = RateDecision::pending;
             if (pool.empty_at_redis && now < pool.retry_at) {
                 reason = RateDecision::exhausted;
@@ -186,6 +189,9 @@ private:
                 blocked = reason;
             }
         }
+        if (local_shortage && metrics_) {
+            metrics_->local_shortage.fetch_add(1, std::memory_order_relaxed);
+        }
         if (blocked != RateDecision::allow) {
             return blocked;
         }
@@ -202,14 +208,23 @@ private:
             auto& pool = *pools_[ids[i]];
             if (sources[i] == Source::lease) {
                 pool.spend();
+                if (metrics_) {
+                    metrics_->spent.fetch_add(1, std::memory_order_relaxed);
+                }
                 if (config_.quotas[ids[i]].batch > 1) {
                     prefetch(ids[i], pool, spend_at);
                 }
             } else if (sources[i] == Source::fallback) {
                 pool.fallback_units -= 1000;
                 ++pool.fallback_spent;
+                if (metrics_) {
+                    metrics_->fallback.fetch_add(1, std::memory_order_relaxed);
+                }
             } else {
                 ++pool.fail_open;
+                if (metrics_) {
+                    metrics_->fail_open.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
         return RateDecision::allow;
@@ -241,6 +256,9 @@ private:
         queue_[(queue_head_ + queue_size_) % queue_.size()] =
             Job{index, pool.generation, batch - available, now};
         ++queue_size_;
+        if (metrics_) {
+            metrics_->queued.store(queue_size_, std::memory_order_relaxed);
+        }
         pool.pending = true;
         lock.unlock();
         notify_event(ready_.get());
@@ -254,6 +272,9 @@ private:
         const auto job = queue_[queue_head_];
         queue_head_ = (queue_head_ + 1) % queue_.size();
         --queue_size_;
+        if (metrics_) {
+            metrics_->queued.store(queue_size_, std::memory_order_relaxed);
+        }
         return job;
     }
 
@@ -288,6 +309,15 @@ private:
                     std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count());
             }
             ++attempts_;
+            if (metrics_) {
+                metrics_->connected.store(connection.connected(), std::memory_order_relaxed);
+                metrics_->outcomes[static_cast<std::size_t>(reply.result)].fetch_add(
+                    1, std::memory_order_relaxed);
+                if (reply.command) {
+                    metrics_->commands.fetch_add(1, std::memory_order_relaxed);
+                    metrics_->duration.observe(finished - started);
+                }
+            }
             publish(*job, reply, finished);
         }
     }
@@ -309,6 +339,10 @@ private:
         const auto wait = reply.wait_ms < 0 ? 250ms : std::chrono::milliseconds(reply.wait_ms);
         pool.retry_at = now + wait;
         pool.granted += reply.tokens;
+        if (metrics_ && reply.tokens) {
+            metrics_->refills.fetch_add(1, std::memory_order_relaxed);
+            metrics_->granted.fetch_add(reply.tokens, std::memory_order_relaxed);
+        }
         const auto expires = job.created + config_.lease;
         if (expires <= now) {
             pool.expired += reply.tokens;
@@ -333,6 +367,7 @@ private:
     }
 
     const RateSettings& config_;
+    RedisMetrics* const metrics_;
     std::vector<std::unique_ptr<Pool>> pools_;
     std::vector<Job> queue_;
     std::mutex queue_mutex_;
@@ -349,7 +384,8 @@ private:
     std::jthread thread_;
 };
 
-RateLimiter::RateLimiter(const RateSettings& settings) : state_(std::make_unique<State>(settings)) {}
+RateLimiter::RateLimiter(const RateSettings& settings, RedisMetrics* metrics)
+    : state_(std::make_unique<State>(settings, metrics)) {}
 RateLimiter::~RateLimiter() = default;
 
 RateDecision RateLimiter::admit(const Route& route, std::optional<std::string_view> api_key) {

@@ -91,6 +91,7 @@ struct RateSettings {
 
 struct Config {
     Endpoint listener;
+    std::optional<Endpoint> metrics_listener;
     std::size_t workers = 2;
     std::size_t clients_per_worker = 1024;
     std::size_t header_bytes = 16384;

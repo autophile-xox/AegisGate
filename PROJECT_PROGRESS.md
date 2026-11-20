@@ -2,7 +2,14 @@
 
 ## Current milestone
 
-M3 Redis-backed distributed rate limiting is implemented and verified on top of the published M1 and M2 gateway.
+M4 is in progress on the published M3 baseline. A fresh Release run verified the M1–M3 suites. The integrated HTTP, quota, resilience, and metrics test passes.
+
+| M4 work | Status |
+| --- | --- |
+| Baseline regression and combined request-path test | Release passed |
+| Prometheus endpoint | Implemented and verified at the HTTP and counter level |
+| Compose, Prometheus scrape, and Grafana | In deployment verification |
+| CI, sanitizers, benchmarks, final audit and documentation | Pending |
 
 ## Completed functionality
 
