@@ -47,7 +47,7 @@ No known critical defects or failing M1 tests. TSan and CI are scheduled for M4.
 
 ## Git status
 
-Local branch `main` contains the verified gateway commit `a71c815`, the socket integration commit `34ddd32`, and the short-I/O test commit `1f6152c`. Use `git log -1 --oneline` to identify the current HEAD. No GitHub remote is configured, and no commits have been pushed.
+The M1 history on `main` includes the gateway commit `a71c815`, the socket integration commit `34ddd32`, the short-I/O test commit `1f6152c`, and the handoff commit `14c7eca`. Use `git log -1 --oneline` to identify the current HEAD. [Public GitHub repository](https://github.com/autophile-xox/AegisGate)
 
 ## Pending milestones
 
