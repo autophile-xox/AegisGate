@@ -860,8 +860,8 @@ void Worker::release(Client& client, bool reusable) {
     }
     const Token token = std::exchange(client.upstream, 0);
     auto& upstream = upstreams_.at(token);
-    if (reusable && pool.idle.size() < config_.backends[client.backend].idle &&
-        idle_socket_usable(upstream.socket.fd.get())) {
+    if (reusable && pool.idle.size() < config_.backends[client.backend].idle) {
+        // Idle readiness and the checkout peek both retire sockets with EOF or unread bytes.
         upstream.client = 0;
         upstream.idle = pool.idle.insert(pool.idle.end(), token);
         if (metrics_) {

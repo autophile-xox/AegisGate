@@ -805,6 +805,26 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(len(self.one.requests), 120)
         self.assertLess(self.one.accepted, 120)
 
+    def test_sustained_pool_overload_keeps_fd_and_queue_counts_bounded(self):
+        self.start(pool="1 0 1", options={"response_timeout_ms": 5000, "clients_per_worker": 64})
+        with self.wire() as active, self.wire() as queued:
+            active.send(request("/hold"))
+            self.assertTrue(self.one.entered.wait(2))
+            queued.send(request("/queued"))
+            self.assertFalse(select.select([queued.socket], [], [], 0.05)[0])
+
+            def excess(_):
+                return self.get("/excess")[0]
+
+            with ThreadPoolExecutor(max_workers=16) as clients:
+                self.assertEqual(list(clients.map(excess, range(96))), [503] * 96)
+            eventually(lambda: self.gateway.fd_count() == self.baseline + 3)
+            self.assertEqual(self.one.requests, ["/hold"])
+            self.one.proceed.set()
+            self.assertEqual(active.response()[0], 200)
+            self.assertEqual(queued.response()[0], 200)
+        eventually(lambda: self.gateway.fd_count() == self.baseline)
+
 
 if __name__ == "__main__":
     BINARY = Path(sys.argv.pop(1)).resolve()
