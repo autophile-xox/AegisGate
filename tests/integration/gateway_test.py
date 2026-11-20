@@ -101,6 +101,9 @@ class Backend(http.server.ThreadingHTTPServer):
         self.label = name.encode()
         self.delay = delay
         self.status = 200
+        self.health_status = 204
+        self.health_delay = 0
+        self.health_requests = 0
         self.lock = threading.Lock()
         self.accepted = 0
         self.requests = []
@@ -151,6 +154,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
+        if self.path == "/health":
+            with self.server.lock:
+                self.server.health_requests += 1
+                status, delay = self.server.health_status, self.server.health_delay
+            if delay:
+                time.sleep(delay)
+            if status == 204:
+                self.send_response(204)
+                self.end_headers()
+            else:
+                self.fixed(b"health unavailable", status)
+            return
         self.record()
         if self.server.delay:
             time.sleep(self.server.delay)
@@ -374,6 +389,55 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("backend=one circuit=closed->open reason=timeout",
                       self.gateway.log.read_text())
         self.assertEqual(self.one.requests, ["/hold"])
+
+    def test_active_health_isolates_and_recovers_an_endpoint(self):
+        two = Backend("two")
+        self.addCleanup(two.close)
+        self.start(backends={"two": two.server_port},
+                   options={"health_interval_ms": 80, "health_failures": 2,
+                            "health_successes": 2, "health_timeout_ms": 160},
+                   routes="group api round_robin one two\nroute * / api\nroute * /one one\n")
+        self.one.health_status = 503
+        eventually(lambda: "backend=one health=healthy->unhealthy reason=http_status"
+                   in self.gateway.log.read_text())
+        self.assertGreaterEqual(self.one.health_requests, 2)
+        self.assertEqual(self.get("/one")[::2], (503, b""))
+        for _ in range(4):
+            self.assertEqual(self.get("/api")[2], b"two:/api")
+        self.assertEqual(self.one.requests, [])
+
+        with self.one.lock:
+            before = self.one.health_requests
+            self.one.health_status = 204
+        eventually(lambda: "backend=one health=unhealthy->healthy"
+                   in self.gateway.log.read_text())
+        self.assertGreaterEqual(self.one.health_requests, before + 2)
+        self.assertEqual(self.get("/one")[2], b"one:/one")
+
+    def test_active_health_timeout_leaves_other_backends_available(self):
+        two = Backend("two")
+        self.addCleanup(two.close)
+        self.start(backends={"two": two.server_port},
+                   options={"health_interval_ms": 60, "health_timeout_ms": 70,
+                            "health_failures": 1, "health_successes": 1},
+                   routes="group api peak_ewma one two\nroute * / api\n")
+        self.one.health_delay = 0.25
+        eventually(lambda: "backend=one health=healthy->unhealthy reason=timeout"
+                   in self.gateway.log.read_text())
+        self.assertEqual(self.get("/api")[2], b"two:/api")
+        self.one.health_delay = 0
+        eventually(lambda: "backend=one health=unhealthy->healthy"
+                   in self.gateway.log.read_text())
+
+    def test_green_health_endpoint_does_not_close_passive_circuit(self):
+        self.start(options={"circuit_breaker": "on", "circuit_min_samples": 1,
+                            "circuit_cooldown_ms": 700, "health_interval_ms": 50})
+        self.one.status = 503
+        self.assertEqual(self.get()[2], b"one failure")
+        target = self.one.health_requests + 2
+        eventually(lambda: self.one.health_requests >= target)
+        self.assertEqual(self.get()[::2], (503, b""))
+        self.assertEqual(self.one.requests, ["/"])
 
     def test_routes_by_host_then_path_and_returns_404(self):
         two = Backend("two")

@@ -54,6 +54,14 @@ struct CircuitSettings {
     std::size_t recovery_successes{2};
 };
 
+struct HealthSettings {
+    std::string path{"/health"};
+    std::chrono::milliseconds interval{0};
+    std::chrono::milliseconds timeout{250};
+    std::size_t failures{2};
+    std::size_t successes{2};
+};
+
 struct Config {
     Endpoint listener;
     std::size_t workers = 2;
@@ -68,6 +76,7 @@ struct Config {
     std::chrono::milliseconds shutdown_timeout{5000};
     LatencySettings latency;
     CircuitSettings circuit;
+    HealthSettings health;
     std::vector<Backend> backends;
     std::vector<BackendGroup> groups;
     std::vector<Route> routes;

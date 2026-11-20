@@ -33,7 +33,7 @@ target_include_directories(aegisgate_core PUBLIC include)
 target_link_libraries(aegisgate_core PUBLIC llhttp::llhttp)
 target_compile_options(aegisgate_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
-add_library(aegisgate_reactor STATIC src/network/worker.cpp)
+add_library(aegisgate_reactor STATIC src/network/worker.cpp src/network/health.cpp)
 target_link_libraries(aegisgate_reactor PUBLIC aegisgate_core Threads::Threads)
 target_compile_options(aegisgate_reactor PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 

@@ -44,12 +44,6 @@ bool idle_socket_usable(int fd) {
     return result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
-int socket_error(int fd) {
-    int error{};
-    socklen_t length = sizeof(error);
-    return getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 ? error : errno;
-}
-
 }  // namespace
 
 void Worker::Buffer::clear() {
@@ -101,6 +95,7 @@ Worker::Worker(const Config& config, int failure_event, std::size_t worker_id)
     for (std::size_t i = 0; i < config.backends.size(); ++i) {
         pools_.emplace_back(config.circuit);
     }
+    configure_health();
     listener_.watch(epoll_.get(), listener_token, EPOLLIN);
     epoll_event event{};
     event.events = EPOLLIN;
@@ -142,6 +137,7 @@ void Worker::run() {
             return;
         }
         expire();
+        tick_health();
         dispatch();
         if (now_ >= accept_retry_) {
             accept_retry_ = never;
@@ -172,6 +168,8 @@ void Worker::run() {
                 on_client(token, event.events);
             } else if (upstreams_.contains(token)) {
                 on_upstream(token, event.events);
+            } else if (probes_.contains(token)) {
+                on_probe(token, event.events);
             }
         }
     }
@@ -187,6 +185,8 @@ void Worker::begin_shutdown() {
         draining_ = true;
         shutdown_deadline_ = now_ + config_.shutdown_timeout;
         accept_retry_ = never;
+        health_due_ = never;
+        probes_.clear();
         listener_.fd.reset();
     }
 }
@@ -586,7 +586,7 @@ int Worker::wait_time() const {
     if (!dispatch_queue_.empty() || (draining_ && engaged_ == 0)) {
         return 0;
     }
-    auto deadline = std::min(accept_retry_, shutdown_deadline_);
+    auto deadline = std::min({accept_retry_, shutdown_deadline_, health_due_});
     if (!deadlines_.empty()) {
         deadline = std::min(deadline, deadlines_.begin()->first);
     }
@@ -603,7 +603,8 @@ bool Worker::capacity(std::size_t backend) const {
 }
 
 bool Worker::eligible(std::size_t backend) const {
-    return pools_[backend].breaker.available(now_);
+    const auto& pool = pools_[backend];
+    return pool.health.healthy && pool.breaker.available(now_);
 }
 
 std::optional<std::size_t> Worker::choose_backend(std::size_t group) {

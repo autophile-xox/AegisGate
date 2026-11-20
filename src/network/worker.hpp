@@ -101,10 +101,31 @@ private:
     struct Pool {
         explicit Pool(const CircuitSettings& settings) : breaker(settings) {}
         CircuitBreaker breaker;
+        struct {
+            std::string request;
+            Time due{never};
+            Token probe{};
+            std::size_t failures{};
+            std::size_t successes{};
+            bool healthy{true};
+        } health;
         Queue idle;
         Queue pending;
         std::size_t count{};
         bool scheduled{};
+    };
+
+    struct Probe {
+        Probe(Fd fd, std::size_t index, bool in_progress)
+            : socket(std::move(fd)), backend(index), connecting(in_progress),
+              response(HTTP_RESPONSE, 8192, 0) {
+            response.reset(true);
+        }
+        WatchedFd socket;
+        std::size_t backend;
+        bool connecting;
+        http::Message response;
+        std::size_t written{};
     };
 
     void run();
@@ -138,6 +159,12 @@ private:
     void retire(Token upstream);
     void schedule(std::size_t backend);
     void dispatch();
+    void configure_health();
+    void tick_health();
+    void start_probe(std::size_t backend);
+    void on_probe(Token token, std::uint32_t events);
+    void finish_probe(Token token, bool success, std::string_view reason);
+    void observe_health(std::size_t backend, bool success, std::string_view reason);
 
     const Config& config_;
     const int failure_event_;
@@ -148,6 +175,7 @@ private:
     std::jthread thread_;
     std::unordered_map<Token, Client> clients_;
     std::unordered_map<Token, Upstream> upstreams_;
+    std::unordered_map<Token, Probe> probes_;
     Deadlines deadlines_;
     std::vector<Pool> pools_;
     Balancer balancer_;
@@ -158,6 +186,7 @@ private:
     Time now_{};
     Time accept_retry_{never};
     Time shutdown_deadline_{never};
+    Time health_due_{never};
     bool draining_{};
 };
 

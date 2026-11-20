@@ -59,6 +59,12 @@ inline bool transient_io() {
     return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 }
 
+inline int socket_error(int fd) {
+    int error{};
+    socklen_t length = sizeof(error);
+    return getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 ? error : errno;
+}
+
 struct WatchedFd {
     explicit WatchedFd(Fd descriptor) : fd(std::move(descriptor)) {}
 

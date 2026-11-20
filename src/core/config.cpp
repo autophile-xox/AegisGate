@@ -254,6 +254,21 @@ Config load_config(const std::filesystem::path& path) {
                 config.circuit.max_probes = number(value, 1, 64);
             } else if (key == "circuit_recovery_successes") {
                 config.circuit.recovery_successes = number(value, 1, 64);
+            } else if (key == "health_path") {
+                if (!value.starts_with('/') || value.size() > 1024 ||
+                    value.find_first_not_of("/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~") !=
+                        std::string::npos) {
+                    throw std::runtime_error("health_path must be a simple absolute HTTP path");
+                }
+                config.health.path = value;
+            } else if (key == "health_interval_ms") {
+                config.health.interval = std::chrono::milliseconds(number(value, 0, 3600000));
+            } else if (key == "health_timeout_ms") {
+                config.health.timeout = milliseconds();
+            } else if (key == "health_failures") {
+                config.health.failures = number(value, 1, 64);
+            } else if (key == "health_successes") {
+                config.health.successes = number(value, 1, 64);
             } else {
                 throw std::runtime_error("unknown setting " + key);
             }
