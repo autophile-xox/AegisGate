@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <ranges>
@@ -58,6 +59,12 @@ bool path_matches(std::string_view prefix, std::string_view path) {
            (path.size() == prefix.size() || prefix.ends_with('/') || path[prefix.size()] == '/');
 }
 
+bool rate_name(std::string_view value) {
+    return !value.empty() && value.size() <= 64 &&
+           value.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") ==
+               std::string_view::npos;
+}
+
 }  // namespace
 
 std::optional<std::string> normalize_host(std::string_view authority) {
@@ -101,7 +108,7 @@ std::optional<std::string> normalize_host(std::string_view authority) {
     return host;
 }
 
-std::optional<std::size_t> Config::route(std::string_view host, std::string_view target) const {
+const Route* Config::match_route(std::string_view host, std::string_view target) const {
     const auto path = target.substr(0, target.find('?'));
     const Route* best = nullptr;
     for (const auto& candidate : routes) {
@@ -114,7 +121,12 @@ std::optional<std::size_t> Config::route(std::string_view host, std::string_view
             best = &candidate;
         }
     }
-    return best == nullptr ? std::nullopt : std::optional(best->group);
+    return best;
+}
+
+std::optional<std::size_t> Config::route(std::string_view host, std::string_view target) const {
+    const auto* match = match_route(host, target);
+    return match ? std::optional(match->group) : std::nullopt;
 }
 
 Config load_config(const std::filesystem::path& path) {
@@ -126,6 +138,9 @@ Config load_config(const std::filesystem::path& path) {
     std::unordered_set<std::string> seen;
     std::vector<std::string> route_groups;
     std::vector<std::vector<std::string>> group_members;
+    std::map<std::pair<std::string, std::string>, std::size_t> route_quotas;
+    std::map<std::string, std::size_t, std::less<>> tenant_quotas;
+    std::vector<std::pair<std::string, std::string>> tenant_keys;
     std::string line;
     std::size_t line_number{};
     try {
@@ -149,6 +164,49 @@ Config load_config(const std::filesystem::path& path) {
                                              " arguments");
                 }
             };
+            auto& rate_limit = config.rate_limit;
+            if (key == "quota") {
+                if (parts.size() < 2 || rate_limit.quotas.size() == 512) {
+                    throw std::runtime_error("expected a quota scope and at most 512 quotas");
+                }
+                const auto index = rate_limit.quotas.size();
+                std::string bucket;
+                if (parts[1] == "global") {
+                    require_count(4);
+                    if (rate_limit.global) {
+                        throw std::runtime_error("duplicate global quota");
+                    }
+                    rate_limit.global = index;
+                    bucket = "global";
+                } else if (parts[1] == "tenant") {
+                    require_count(5);
+                    if (!rate_name(parts[2]) || !tenant_quotas.emplace(parts[2], index).second) {
+                        throw std::runtime_error("expected a unique tenant name");
+                    }
+                    bucket = "tenant:" + parts[2];
+                } else if (parts[1] == "route") {
+                    require_count(6);
+                    if (!route_quotas.emplace(std::pair(parts[2], parts[3]), index).second) {
+                        throw std::runtime_error("duplicate route quota");
+                    }
+                    bucket = "route:" + parts[2] + parts[3];
+                } else {
+                    throw std::runtime_error("quota scope must be global, tenant or route");
+                }
+                const auto capacity = number(parts[parts.size() - 3], 1, 1000000000);
+                rate_limit.quotas.push_back({std::move(bucket), capacity,
+                    number(parts[parts.size() - 2], 0, 1000000000),
+                    number(parts.back(), 1, capacity)});
+                continue;
+            }
+            if (key == "tenant_key") {
+                require_count(2);
+                if (tenant_keys.size() == 1024 || !rate_name(parts[2])) {
+                    throw std::runtime_error("expected an environment variable and at most 1024 tenant keys");
+                }
+                tenant_keys.emplace_back(parts[1], parts[2]);
+                continue;
+            }
             if (key == "backend") {
                 require_count(6);
                 if (config.backends.size() == 64 ||
@@ -204,6 +262,17 @@ Config load_config(const std::filesystem::path& path) {
             if (key == "listen") {
                 require_count(2);
                 config.listener = endpoint(parts[1], parts[2]);
+                continue;
+            }
+            if (key == "redis") {
+                require_count(2);
+                rate_limit.redis = endpoint(parts[1], parts[2]);
+                continue;
+            }
+            if (key == "rate_fallback") {
+                require_count(2);
+                rate_limit.fallback_capacity = number(parts[1], 1, 1000000000);
+                rate_limit.fallback_rate = number(parts[2], 0, 1000000000);
                 continue;
             }
             require_count(1);
@@ -269,6 +338,34 @@ Config load_config(const std::filesystem::path& path) {
                 config.health.failures = number(value, 1, 64);
             } else if (key == "health_successes") {
                 config.health.successes = number(value, 1, 64);
+            } else if (key == "rate_namespace") {
+                if (!rate_name(value)) {
+                    throw std::runtime_error("invalid rate_namespace");
+                }
+                rate_limit.key_namespace = value;
+            } else if (key == "rate_timeout_ms") {
+                rate_limit.timeout = std::chrono::milliseconds(number(value, 1, 10000));
+            } else if (key == "rate_wait_ms") {
+                rate_limit.wait = std::chrono::milliseconds(number(value, 0, 10000));
+            } else if (key == "rate_lease_ms") {
+                rate_limit.lease = milliseconds();
+            } else if (key == "rate_queue") {
+                rate_limit.queue = number(value, 1, 1024);
+            } else if (key == "rate_failure") {
+                if (value == "closed") {
+                    rate_limit.failure = RateFailure::closed;
+                } else if (value == "fallback") {
+                    rate_limit.failure = RateFailure::fallback;
+                } else if (value == "open") {
+                    rate_limit.failure = RateFailure::open;
+                } else {
+                    throw std::runtime_error("rate_failure must be closed, fallback or open");
+                }
+            } else if (key == "rate_diagnostics") {
+                if (value != "on" && value != "off") {
+                    throw std::runtime_error("rate_diagnostics must be on or off");
+                }
+                rate_limit.diagnostics = value == "on";
             } else {
                 throw std::runtime_error("unknown setting " + key);
             }
@@ -324,6 +421,37 @@ Config load_config(const std::filesystem::path& path) {
             throw std::runtime_error("unknown route backend or group " + route_groups[i]);
         }
         config.routes[i].group = static_cast<std::size_t>(group - config.groups.begin());
+        auto& route = config.routes[i];
+        if (const auto quota = route_quotas.find({route.host, route.prefix}); quota != route_quotas.end()) {
+            route.quota = quota->second;
+            route_quotas.erase(quota);
+        }
+    }
+    auto& rate_limit = config.rate_limit;
+    if (!route_quotas.empty() || rate_limit.redis.has_value() != !rate_limit.quotas.empty()) {
+        throw std::runtime_error("quotas require Redis and route quotas must match configured routes");
+    }
+    if (rate_limit.failure == RateFailure::fallback && rate_limit.fallback_capacity == 0) {
+        throw std::runtime_error("rate_failure fallback requires rate_fallback capacity and rate");
+    }
+    for (auto& quota : rate_limit.quotas) {
+        quota.key = rate_limit.key_namespace + ":" + quota.key;
+    }
+    std::unordered_set<std::size_t> keyed_tenants;
+    for (const auto& [tenant, variable] : tenant_keys) {
+        const auto quota = tenant_quotas.find(tenant);
+        const char* raw = std::getenv(variable.c_str());
+        const std::string_view value = raw ? raw : "";
+        if (quota == tenant_quotas.end() || value.empty() || value.size() > 256 ||
+            !std::ranges::all_of(value, [](unsigned char c) { return c > 32 && c < 127; }) ||
+            !rate_limit.tenants.emplace(value, quota->second).second) {
+            throw std::runtime_error("tenant_key requires a known tenant and a unique printable key in " +
+                                     variable);
+        }
+        keyed_tenants.insert(quota->second);
+    }
+    if (keyed_tenants.size() != tenant_quotas.size()) {
+        throw std::runtime_error("each tenant quota needs a tenant_key environment mapping");
     }
     return config;
 }

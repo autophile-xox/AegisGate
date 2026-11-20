@@ -92,6 +92,33 @@ TEST_F(ConfigTest, ValidatesHealthAndCircuitOptions) {
     }
 }
 
+TEST_F(ConfigTest, ResolvesAllRateScopesAndEnvironmentIdentity) {
+    ASSERT_EQ(setenv("AEGISGATE_UNIT_TEST_IDENTITY", "unit-fixture-only", 1), 0);
+    const auto config = load(
+        "listen 127.0.0.1 8080\nbackend one 127.0.0.1 9000 4 2 2\nroute * /api one\n"
+        "redis 127.0.0.1 6379\nrate_namespace fixture\nquota global 20 0 4\n"
+        "quota tenant tenant-a 7 3 2\ntenant_key tenant-a AEGISGATE_UNIT_TEST_IDENTITY\n"
+        "quota route * /api 10 2 5\n");
+    unsetenv("AEGISGATE_UNIT_TEST_IDENTITY");
+    ASSERT_TRUE(config.rate_limit.redis);
+    EXPECT_EQ(config.rate_limit.failure, aegisgate::RateFailure::closed);
+    EXPECT_EQ(config.rate_limit.global, 0U);
+    EXPECT_EQ(config.rate_limit.tenants.at("unit-fixture-only"), 1U);
+    EXPECT_EQ(config.match_route("test", "/api/items")->quota, 2U);
+    EXPECT_EQ(config.rate_limit.quotas[2].key, "fixture:route:*/api");
+}
+
+TEST_F(ConfigTest, RejectsUnresolvedAndUnsafeRateSettings) {
+    const std::string base = "listen 127.0.0.1 8080\nbackend one 127.0.0.1 9000 4 2 2\nroute * /api one\n";
+    for (const auto* config : {"quota global 10 0 2\n", "redis 127.0.0.1 6379\n",
+                              "redis 127.0.0.1 6379\nquota global 4 0 5\n",
+                              "redis 127.0.0.1 6379\nquota route * /missing 4 0 1\n",
+                              "redis 127.0.0.1 6379\nquota tenant x 4 0 1\n",
+                              "redis 127.0.0.1 6379\nquota global 4 0 1\nrate_failure fallback\n"}) {
+        EXPECT_THROW(load(base + config), std::runtime_error);
+    }
+}
+
 TEST(Config, NormalizesHostAndValidatesAuthority) {
     EXPECT_EQ(aegisgate::normalize_host("Test.Example:8080"), "test.example");
     EXPECT_EQ(aegisgate::normalize_host("[0:0:0:0:0:0:0:1]:80"), "[::1]");

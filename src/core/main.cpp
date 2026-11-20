@@ -13,6 +13,9 @@ namespace {
 
 int serve(const aegisgate::Config& config) {
     using namespace aegisgate;
+    if (config.rate_limit.redis) {
+        throw std::runtime_error("rate limiting is unavailable in this build");
+    }
     sigset_t signals;
     sigemptyset(&signals);
     sigaddset(&signals, SIGINT);

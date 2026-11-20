@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,6 +29,7 @@ struct Route {
     std::string host;
     std::string prefix;
     std::size_t group;
+    std::optional<std::size_t> quota{};
 };
 
 enum class BalancePolicy { round_robin, peak_ewma };
@@ -62,6 +64,31 @@ struct HealthSettings {
     std::size_t successes{2};
 };
 
+enum class RateFailure { closed, fallback, open };
+
+struct QuotaSettings {
+    std::string key;
+    std::size_t capacity;
+    std::size_t rate;
+    std::size_t batch;
+};
+
+struct RateSettings {
+    std::optional<Endpoint> redis;
+    std::string key_namespace{"aegisgate"};
+    std::chrono::milliseconds timeout{100};
+    std::chrono::milliseconds wait{20};
+    std::chrono::milliseconds lease{1000};
+    std::size_t queue{64};
+    RateFailure failure{RateFailure::closed};
+    std::size_t fallback_capacity{};
+    std::size_t fallback_rate{};
+    bool diagnostics{};
+    std::optional<std::size_t> global;
+    std::map<std::string, std::size_t, std::less<>> tenants;
+    std::vector<QuotaSettings> quotas;
+};
+
 struct Config {
     Endpoint listener;
     std::size_t workers = 2;
@@ -77,12 +104,14 @@ struct Config {
     LatencySettings latency;
     CircuitSettings circuit;
     HealthSettings health;
+    RateSettings rate_limit;
     std::vector<Backend> backends;
     std::vector<BackendGroup> groups;
     std::vector<Route> routes;
 
     [[nodiscard]] std::optional<std::size_t> route(
         std::string_view host, std::string_view target) const;
+    [[nodiscard]] const Route* match_route(std::string_view host, std::string_view target) const;
 };
 
 [[nodiscard]] Config load_config(const std::filesystem::path& path);
