@@ -4,14 +4,19 @@
 
 M4 completes Stage 1. A fresh Release run independently verified the published M3 baseline at `7abae1d` before M4 changes. The final implementation passes combined request-path tests and verification of the live deployment.
 
-| M4 work | Status |
-| --- | --- |
-| M1–M3 regression and combined request-path test | Verified on the baseline and on the final implementation |
-| Prometheus endpoint | Live scrape, measured counter assertions, and promtool validation passed |
-| Compose, Prometheus, and Grafana | Two gateways and all 14 panels verified with live traffic, quota rejection, and backend recovery |
-| CI and sanitizers | Four C++ build variants, simulator checks, and the live deployment passed on GitHub |
-| Benchmark and profile | All seven scenario categories executed. Socket trace repeated after the pool optimization |
-| Final audit and documentation | Source review, overload regression, private evidence check, and reproduction instructions complete |
+**Final acceptance readiness: READY WITH LIMITATIONS.** The acceptance audit reviewed existing source, local test logs, GitHub job outcomes, and raw benchmark evidence.
+
+| Acceptance criterion | Status | Evidence and scope |
+| --- | --- | --- |
+| HTTP/1.1 proxy, keep-alive, pooling, and deadlines | VERIFIED | Real socket tests cover reuse, stale sockets, chunked bodies, malformed framing, stalls, disconnects, bounded queues, and graceful shutdown. |
+| Peak-EWMA, breakers, health, and fault injection | VERIFIED | Unit and real traffic tests cover slow origins, fast 503s, half-open recovery, and listener failure. Paired Release experiments exercise both balancing policies and breaker settings. |
+| Redis quota leasing across replicas | VERIFIED | Real Redis tests and two-process fixed-quota runs confirmed shared accounting. Delayed and failed refills, fallback, and recovery were exercised while the reactors remained responsive. |
+| Prometheus, Grafana, and Compose | VERIFIED | Two live scrape targets and 14 live dashboard queries, with real traffic, quota rejection, origin isolation, and recovery. |
+| Hosted CI and sanitizers | VERIFIED | Four C++ build variants, Go race and vet checks, and live deployment passed on GitHub. |
+| Benchmark reproducibility | VERIFIED | Versioned scripts produced raw data for all seven scenarios, including a three-minute endurance repeat. High-rate trials with generator drops establish an observed rate only. |
+| Redis durability across abrupt host failure | IMPLEMENTED BUT UNVERIFIED | Compose enables append-only persistence. Abrupt host failure and data retention were outside the verification runs. |
+| Stage 2 protocols, authenticated Redis transport, and multi-host validation | INCOMPLETE | Future scope. Maximum sustainable capacity and Redis failover correctness are unmeasured. |
+| Current Stage 1 acceptance failures | None | Initial TSan startup and exploratory traced-load failures are recorded with their rerun conditions and limitations. |
 
 ## Completed functionality
 
@@ -65,11 +70,11 @@ TSAN_OPTIONS=halt_on_error=1 setarch x86_64 -R \
 (cd upstream-simulator && go test -race -count=1 ./... && go vet ./...)
 ~~~
 
-Debug, Release, ASan/UBSan, and TSan each passed all 31 CTest entries. This covers 27 GoogleTest cases, 36 HTTP and resilience integration cases, 14 rate-limiter integration cases, three real Redis Lua cases, and a targeted short-I/O repeat. No sanitizer findings were reported. GCC TSan initially rejected the address-space layout during startup on WSL2. The full suite ran successfully with the process-local `setarch -R` override above. The three Go cases passed under the race detector, and `go vet` passed. CI also compiled the Python sources and built the C++ targets with warnings as errors. [Verified workflow for e13f35a](https://github.com/autophile-xox/AegisGate/actions/runs/44677362848)
+Debug, Release, ASan/UBSan, and TSan each passed all 31 CTest entries. This covers 27 GoogleTest cases, 36 HTTP and resilience integration cases, 14 rate-limiter integration cases, three real Redis Lua cases, and a targeted short-I/O repeat. No sanitizer findings were reported. The first WSL2 TSan startup **FAILED** on its address-space layout. The full suite ran successfully with the process-local `setarch -R` override above. The three Go cases passed under the race detector, and `go vet` passed. CI also compiled the Python sources and built the C++ targets with warnings as errors. [Six successful jobs at b141f37](https://github.com/autophile-xox/AegisGate/actions/runs/44678311863)
 
 ## Benchmark and final audit
 
-The Release runs covered direct and proxied traffic at three offered rates, Peak-EWMA versus round-robin with a slow origin, breakers with and without isolation during HTTP 503 bursts, disabled and enabled rate limits, Redis leases versus per-request authorization, concurrent shared quota, and a one-minute run with resource sampling. The high-rate runs include generator drops. The shared fixed-budget test exhausted the single Redis ledger without observed over-admission. Repeatable raw evidence and derived claims are in the ignored `resume_metrics.local.md` and `.local/benchmark-results/` paths. [Benchmark reproduction](docs/benchmarks.md)
+The Release runs covered direct and proxied traffic at three offered rates, Peak-EWMA versus round-robin with a slow origin, breakers with and without isolation during HTTP 503 bursts, disabled and enabled rate limits, Redis leases versus per-request authorization, concurrent shared quota, and endurance runs with resource sampling. The high-rate runs include generator drops. The shared fixed-budget test exhausted the single Redis ledger without observed over-admission. Raw measurements and derived claims are in the ignored `resume_metrics.local.md` and `.local/benchmark-results/` paths. The private resume and interview handoff is `RESUME_AND_INTERVIEW.local.md`. [Benchmark reproduction](docs/benchmarks.md)
 
 The final review checked epoll registration lifetimes, idle pool reuse, parser framing and limits, shutdown deadlines, worker-local health and breaker state, Redis refill generations and debits, API-key handling, and bounded metric labels. The socket trace motivated removal of a duplicate check when returning sockets to the idle pool. Idle epoll monitoring and checkout validation remain. The overload regression verifies stable queue depth and recovery to the initial process descriptor count. The trace confirmed fewer socket probes. The untraced results did not isolate a CPU or latency improvement from that change. [Architecture and failure semantics](docs/architecture.md)
 
@@ -79,7 +84,7 @@ The verified configurations have no known critical defects or failing tests. Red
 
 ## Git status
 
-The last verified runtime and benchmark commit is `e13f35aa198d6a4f5e1949600577d15b1d5ce416` on GitHub `main`. Its history includes live metrics `3224f5d`, deployment and CI `07b60f77`, and pool optimization `7d00288`. Use `git log -1 --oneline` to identify the current HEAD. [Public GitHub history](https://github.com/autophile-xox/AegisGate/commits/main/)
+The Stage 1 delivery at `b141f378621289d27fcb8a54ef170cc628b3f082` was published on GitHub `main` and passed the full hosted workflow. Its history includes live metrics `3224f5d`, deployment and CI `07b60f77`, pool optimization `7d00288`, and the final benchmark harness `e13f35a`. The acceptance handoff adds documentation and private-file exclusions. [Public GitHub history](https://github.com/autophile-xox/AegisGate/commits/main/) · [Latest workflow runs](https://github.com/autophile-xox/AegisGate/actions/workflows/stage-one.yml)
 
 ## Pending milestones
 

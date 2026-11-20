@@ -1,6 +1,7 @@
 /build/
 /build-*/
 /resume_metrics.local.md
+/RESUME_AND_INTERVIEW.local.md
 /.local/benchmark-results/
 __pycache__/
 /.env

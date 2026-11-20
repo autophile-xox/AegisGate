@@ -1,6 +1,7 @@
 .git
 .local
 resume_metrics.local.md
+RESUME_AND_INTERVIEW.local.md
 .env
 .env.*
 build
