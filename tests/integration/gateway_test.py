@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
 import http.server
+import os
 from pathlib import Path
 import select
 import signal
@@ -245,6 +246,8 @@ class ServerProcess:
             raise
         if status != 0:
             raise AssertionError(f"gateway returned {status}: {self.log.read_text()}")
+        if os.getenv("AEGISGATE_EXPECT_SHORT_IO") and "short I/O exercised" not in self.log.read_text():
+            raise AssertionError("test did not observe short reads, short writes and transient I/O")
 
     def fd_count(self):
         return len(list(Path(f"/proc/{self.process.pid}/fd").iterdir()))
@@ -603,9 +606,11 @@ class GatewayTests(unittest.TestCase):
 
     def test_concurrent_clients_across_reuseport_workers(self):
         self.start(options={"workers": 3}, pool="16 8 16")
+        connected = threading.Barrier(24, timeout=2)
 
         def visit(index):
             with self.wire() as wire:
+                connected.wait()
                 for iteration in range(5):
                     path = f"/concurrent/{index}/{iteration}"
                     wire.send(request(path))
