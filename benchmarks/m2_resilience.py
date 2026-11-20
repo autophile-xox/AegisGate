@@ -68,6 +68,8 @@ class Connection:
         self.reader = self.writer = None
 
     async def get(self, path):
+        if self.writer is not None and (self.reader.at_eof() or self.writer.is_closing()):
+            self.close()
         if self.writer is None:
             self.reader, self.writer = await asyncio.open_connection(HOST, self.port)
         self.writer.write(f"GET {path} HTTP/1.1\r\nHost: benchmark.test\r\n\r\n".encode())
