@@ -54,6 +54,28 @@ TEST_F(ConfigTest, RejectsInvalidSettingsAndReferences) {
     }
 }
 
+TEST_F(ConfigTest, ResolvesNamedGroupsAndPreservesDirectRoutes) {
+    const auto config = load(
+        "listen 127.0.0.1 8080\nroute * / merged\nroute * /one local\n"
+        "group merged peak_ewma other local\n"
+        "backend local 127.0.0.1 9000 8 4 2\nbackend other 127.0.0.1 9001 8 4 2\n"
+        "ewma_initial_ms 5\newma_decay_ms 80\newma_stale_ms 400\n");
+    ASSERT_EQ(config.route("x", "/bar"), 2U);
+    EXPECT_EQ(config.groups[2].policy, aegisgate::BalancePolicy::peak_ewma);
+    EXPECT_EQ(config.groups[2].backends, (std::vector<std::size_t>{1, 0}));
+    EXPECT_EQ(config.route("x", "/one"), 0U);
+    EXPECT_EQ(config.latency.decay.count(), 80);
+}
+
+TEST_F(ConfigTest, RejectsInvalidGroupsAndSmoothing) {
+    const std::string base = "listen 127.0.0.1 8080\nbackend one 127.0.0.1 9000 8 4 2\nroute * / one\n";
+    for (const auto* line : {"group one round_robin one\n", "group g peak_ewma one one\n",
+                            "group g round_robin missing\n", "group g bad one\n",
+                            "ewma_decay_ms 100\newma_stale_ms 20\n"}) {
+        EXPECT_THROW(load(base + line), std::runtime_error);
+    }
+}
+
 TEST(Config, NormalizesHostAndValidatesAuthority) {
     EXPECT_EQ(aegisgate::normalize_host("Test.Example:8080"), "test.example");
     EXPECT_EQ(aegisgate::normalize_host("[0:0:0:0:0:0:0:1]:80"), "[::1]");

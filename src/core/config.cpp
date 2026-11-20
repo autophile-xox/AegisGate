@@ -114,7 +114,7 @@ std::optional<std::size_t> Config::route(std::string_view host, std::string_view
             best = &candidate;
         }
     }
-    return best == nullptr ? std::nullopt : std::optional(best->backend);
+    return best == nullptr ? std::nullopt : std::optional(best->group);
 }
 
 Config load_config(const std::filesystem::path& path) {
@@ -124,7 +124,8 @@ Config load_config(const std::filesystem::path& path) {
     }
     Config config;
     std::unordered_set<std::string> seen;
-    std::vector<std::string> route_backends;
+    std::vector<std::string> route_groups;
+    std::vector<std::vector<std::string>> group_members;
     std::string line;
     std::size_t line_number{};
     try {
@@ -161,6 +162,24 @@ Config load_config(const std::filesystem::path& path) {
                                            number(parts[6], 0, 16384)});
                 continue;
             }
+            if (key == "group") {
+                if (parts.size() < 4 || parts.size() > 67 || config.groups.size() == 64 ||
+                    std::ranges::find(config.groups, parts[1], &BackendGroup::name) !=
+                        config.groups.end()) {
+                    throw std::runtime_error("group requires a unique name, policy and 1..64 backends");
+                }
+                BalancePolicy policy;
+                if (parts[2] == "round_robin") {
+                    policy = BalancePolicy::round_robin;
+                } else if (parts[2] == "peak_ewma") {
+                    policy = BalancePolicy::peak_ewma;
+                } else {
+                    throw std::runtime_error("group policy must be round_robin or peak_ewma");
+                }
+                group_members.emplace_back(parts.begin() + 3, parts.end());
+                config.groups.push_back({parts[1], policy, {}});
+                continue;
+            }
             if (key == "route") {
                 require_count(3);
                 const auto host = parts[1] == "*" ? std::optional(parts[1])
@@ -176,7 +195,7 @@ Config load_config(const std::filesystem::path& path) {
                     throw std::runtime_error("duplicate route or more than 256 routes");
                 }
                 config.routes.push_back({*host, parts[2], 0});
-                route_backends.push_back(parts[3]);
+                route_groups.push_back(parts[3]);
                 continue;
             }
             if (!seen.insert(key).second) {
@@ -212,6 +231,12 @@ Config load_config(const std::filesystem::path& path) {
                 config.response_timeout = milliseconds();
             } else if (key == "shutdown_timeout_ms") {
                 config.shutdown_timeout = milliseconds();
+            } else if (key == "ewma_decay_ms") {
+                config.latency.decay = milliseconds();
+            } else if (key == "ewma_stale_ms") {
+                config.latency.stale = milliseconds();
+            } else if (key == "ewma_initial_ms") {
+                config.latency.initial = milliseconds();
             } else {
                 throw std::runtime_error("unknown setting " + key);
             }
@@ -230,12 +255,40 @@ Config load_config(const std::filesystem::path& path) {
     if (config.stream_buffer_bytes < config.header_bytes + 128) {
         throw std::runtime_error("stream_buffer_bytes must be at least header_bytes + 128");
     }
-    for (std::size_t i = 0; i < config.routes.size(); ++i) {
-        const auto backend = std::ranges::find(config.backends, route_backends[i], &Backend::name);
-        if (backend == config.backends.end()) {
-            throw std::runtime_error("unknown route backend " + route_backends[i]);
+    if (config.latency.stale < config.latency.decay) {
+        throw std::runtime_error("ewma_stale_ms must be at least ewma_decay_ms");
+    }
+
+    // Each backend name is also an implicit single-backend group for existing configs.
+    std::vector<BackendGroup> groups;
+    for (std::size_t i = 0; i < config.backends.size(); ++i) {
+        groups.push_back({config.backends[i].name, BalancePolicy::round_robin, {i}});
+    }
+    for (std::size_t i = 0; i < config.groups.size(); ++i) {
+        auto& group = config.groups[i];
+        if (std::ranges::find(groups, group.name, &BackendGroup::name) != groups.end()) {
+            throw std::runtime_error("group name conflicts with backend " + group.name);
         }
-        config.routes[i].backend = static_cast<std::size_t>(backend - config.backends.begin());
+        for (const auto& member : group_members[i]) {
+            const auto backend = std::ranges::find(config.backends, member, &Backend::name);
+            if (backend == config.backends.end()) {
+                throw std::runtime_error("unknown group backend " + member);
+            }
+            const auto index = static_cast<std::size_t>(backend - config.backends.begin());
+            if (std::ranges::find(group.backends, index) != group.backends.end()) {
+                throw std::runtime_error("duplicate backend " + member + " in group " + group.name);
+            }
+            group.backends.push_back(index);
+        }
+        groups.push_back(std::move(group));
+    }
+    config.groups = std::move(groups);
+    for (std::size_t i = 0; i < config.routes.size(); ++i) {
+        const auto group = std::ranges::find(config.groups, route_groups[i], &BackendGroup::name);
+        if (group == config.groups.end()) {
+            throw std::runtime_error("unknown route backend or group " + route_groups[i]);
+        }
+        config.routes[i].group = static_cast<std::size_t>(group - config.groups.begin());
     }
     return config;
 }

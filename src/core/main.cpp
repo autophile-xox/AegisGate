@@ -24,7 +24,7 @@ int serve(const aegisgate::Config& config) {
     auto failure_fd = checked_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC), "supervisor eventfd");
     std::vector<std::unique_ptr<Worker>> workers;
     for (std::size_t i = 0; i < config.workers; ++i) {
-        workers.push_back(std::make_unique<Worker>(config, failure_fd.get()));
+        workers.push_back(std::make_unique<Worker>(config, failure_fd.get(), i));
     }
     for (auto& worker : workers) {
         worker->start();

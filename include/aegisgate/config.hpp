@@ -27,7 +27,21 @@ struct Backend {
 struct Route {
     std::string host;
     std::string prefix;
-    std::size_t backend;
+    std::size_t group;
+};
+
+enum class BalancePolicy { round_robin, peak_ewma };
+
+struct BackendGroup {
+    std::string name;
+    BalancePolicy policy;
+    std::vector<std::size_t> backends;
+};
+
+struct LatencySettings {
+    std::chrono::milliseconds decay{500};
+    std::chrono::milliseconds stale{3000};
+    std::chrono::milliseconds initial{10};
 };
 
 struct Config {
@@ -42,7 +56,9 @@ struct Config {
     std::chrono::milliseconds connect_timeout{1500};
     std::chrono::milliseconds response_timeout{10000};
     std::chrono::milliseconds shutdown_timeout{5000};
+    LatencySettings latency;
     std::vector<Backend> backends;
+    std::vector<BackendGroup> groups;
     std::vector<Route> routes;
 
     [[nodiscard]] std::optional<std::size_t> route(

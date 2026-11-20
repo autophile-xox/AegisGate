@@ -92,11 +92,12 @@ Worker::Client::Client(Fd fd, const Config& config)
     : socket(std::move(fd)), request(HTTP_REQUEST, config.header_bytes, config.body_bytes),
       response(HTTP_RESPONSE, config.header_bytes, config.body_bytes) {}
 
-Worker::Worker(const Config& config, int failure_event)
+Worker::Worker(const Config& config, int failure_event, std::size_t worker_id)
     : config_(config), failure_event_(failure_event),
       epoll_(checked_fd(epoll_create1(EPOLL_CLOEXEC), "epoll_create1")),
       wakeup_(checked_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC), "worker eventfd")),
-      listener_(open_listener(config.listener)), pools_(config.backends.size()) {
+      listener_(open_listener(config.listener)), pools_(config.backends.size()),
+      balancer_(config, worker_id + 1) {
     listener_.watch(epoll_.get(), listener_token, EPOLLIN);
     epoll_event event{};
     event.events = EPOLLIN;
@@ -296,9 +297,14 @@ void Worker::pump_request(Token token, Client& client) {
         }
         if (!had_headers && client.request.has_headers()) {
             client.header_deadline = never;
-            const auto backend = config_.route(client.request.host(), client.request.target());
-            if (!backend) {
+            const auto group = config_.route(client.request.host(), client.request.target());
+            if (!group) {
                 fail(client, 404);
+                return;
+            }
+            const auto backend = choose_backend(*group);
+            if (!backend) {
+                fail(client, 503);
                 return;
             }
             client.engaged = true;
@@ -401,6 +407,7 @@ void Worker::read_response(Client& client, Upstream& upstream, bool hangup) {
         return;
     }
     if (!had_headers && client.response.has_headers()) {
+        client.response_headers_at = now_;
         if (!client.request.complete() || !client.to_upstream.empty()) {
             client.upload_cancelled = true;
             client.close_after = true;
@@ -419,6 +426,9 @@ void Worker::read_response(Client& client, Upstream& upstream, bool hangup) {
 }
 
 void Worker::finish_response(Client& client, bool reusable) {
+    const auto sample = client.response.status() < 500
+        ? std::optional(client.response_headers_at - client.attempt_started) : std::nullopt;
+    account_attempt(client, sample);
     release(client, reusable);
     client.exchange_deadline = never;
     client.terminal = true;
@@ -585,6 +595,28 @@ bool Worker::capacity(std::size_t backend) const {
     return !pool.idle.empty() || pool.count < config_.backends[backend].connections;
 }
 
+std::optional<std::size_t> Worker::choose_backend(std::size_t group) {
+    std::array<std::size_t, 64> ready;
+    std::array<std::size_t, 64> queued;
+    std::size_t ready_count = 0;
+    std::size_t queued_count = 0;
+    for (const auto backend : config_.groups[group].backends) {
+        const auto& pool = pools_[backend];
+        if (pool.pending.empty() && capacity(backend)) {
+            ready[ready_count++] = backend;
+        } else if (pool.pending.size() < config_.backends[backend].pending) {
+            queued[queued_count++] = backend;
+        }
+    }
+    if (ready_count != 0) {
+        return balancer_.choose(group, std::span(ready).first(ready_count), now_);
+    }
+    if (queued_count != 0) {
+        return balancer_.choose(group, std::span(queued).first(queued_count), now_);
+    }
+    return std::nullopt;
+}
+
 void Worker::admit(Token token, Client& client) {
     auto& pool = pools_[client.backend];
     if (pool.pending.empty() && capacity(client.backend)) {
@@ -598,6 +630,9 @@ void Worker::admit(Token token, Client& client) {
 }
 
 void Worker::assign(Token token, Client& client) {
+    balancer_.begin(client.backend);
+    client.attempt_started = now_;
+    client.response_headers_at = never;
     auto& pool = pools_[client.backend];
     if (!pool.idle.empty()) {
         const auto idle = pool.idle.back();
@@ -634,7 +669,15 @@ void Worker::assign(Token token, Client& client) {
     client.upstream = upstream;
 }
 
+void Worker::account_attempt(Client& client, std::optional<Clock::duration> latency) {
+    if (client.attempt_started != never) {
+        balancer_.finish(client.backend, latency, now_);
+        client.attempt_started = never;
+    }
+}
+
 void Worker::release(Client& client, bool reusable) {
+    account_attempt(client, std::nullopt);
     auto& pool = pools_[client.backend];
     if (client.pending) {
         pool.pending.erase(*client.pending);

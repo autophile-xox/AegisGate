@@ -32,6 +32,7 @@ public:
     [[nodiscard]] bool has_headers() const { return headers_complete_; }
     [[nodiscard]] bool complete() const { return complete_; }
     [[nodiscard]] int error_status() const { return error_status_; }
+    [[nodiscard]] int status() const { return status_; }
     [[nodiscard]] bool keep_alive() const { return keep_alive_; }
     [[nodiscard]] bool is_head() const { return parser_.method == HTTP_HEAD; }
     [[nodiscard]] std::string_view target() const { return target_; }

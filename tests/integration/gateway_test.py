@@ -96,9 +96,10 @@ class Backend(http.server.ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128
 
-    def __init__(self, name):
+    def __init__(self, name, delay=0):
         super().__init__((HOST, 0), Handler)
         self.label = name.encode()
+        self.delay = delay
         self.lock = threading.Lock()
         self.accepted = 0
         self.requests = []
@@ -150,6 +151,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.record()
+        if self.server.delay:
+            time.sleep(self.server.delay)
         if self.path == "/no-content":
             self.send_response(204)
             self.end_headers()
@@ -280,6 +283,30 @@ class GatewayTests(unittest.TestCase):
 
     def wire(self, receive_buffer=None):
         return Wire(self.port, receive_buffer)
+
+    def test_named_group_round_robin_routes_in_order(self):
+        two = Backend("two")
+        self.addCleanup(two.close)
+        self.start(backends={"two": two.server_port},
+                   routes="group api round_robin one two\nroute * / api\n")
+        with self.wire() as wire:
+            for label in (b"one", b"two") * 4:
+                wire.send(request("/balance"))
+                self.assertEqual(wire.response()[2], label + b":/balance")
+
+    def test_peak_ewma_steers_away_from_measured_slow_backend(self):
+        two = Backend("two", delay=0.06)
+        self.addCleanup(two.close)
+        self.start(backends={"two": two.server_port},
+                   routes="group api peak_ewma one two\nroute * / api\n"
+                          "route * /fast one\nroute * /slow two\n")
+        with self.wire() as wire:
+            for path, label in (("/fast", b"one"), ("/slow", b"two")):
+                wire.send(request(path))
+                self.assertEqual(wire.response()[2], label + b":" + path.encode())
+            for _ in range(12):
+                wire.send(request("/balance"))
+                self.assertEqual(wire.response()[2], b"one:/balance")
 
     def test_routes_by_host_then_path_and_returns_404(self):
         two = Backend("two")

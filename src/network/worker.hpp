@@ -4,6 +4,7 @@
 
 #include "aegisgate/config.hpp"
 #include "aegisgate/http/message.hpp"
+#include "aegisgate/routing/balancer.hpp"
 
 #include <array>
 #include <deque>
@@ -17,7 +18,7 @@ namespace aegisgate {
 
 class Worker {
 public:
-    Worker(const Config& config, int failure_event);
+    Worker(const Config& config, int failure_event, std::size_t worker_id);
     ~Worker();
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
@@ -70,6 +71,8 @@ private:
         Time read_deadline{never};
         Time write_deadline{never};
         Time linger_deadline{never};
+        Time attempt_started{never};
+        Time response_headers_at{never};
         bool engaged{};
         bool terminal{};
         bool close_after{};
@@ -121,8 +124,10 @@ private:
     void update_deadline(Token token, Client& client, Time connect_deadline);
 
     void admit(Token token, Client& client);
+    [[nodiscard]] std::optional<std::size_t> choose_backend(std::size_t group);
     [[nodiscard]] bool capacity(std::size_t backend) const;
     void assign(Token token, Client& client);
+    void account_attempt(Client& client, std::optional<Clock::duration> latency);
     void release(Client& client, bool reusable);
     void retire(Token upstream);
     void schedule(std::size_t backend);
@@ -138,6 +143,7 @@ private:
     std::unordered_map<Token, Upstream> upstreams_;
     Deadlines deadlines_;
     std::vector<Pool> pools_;
+    Balancer balancer_;
     std::deque<std::size_t> dispatch_queue_;
     std::array<char, io_bytes> scratch_{};
     Token next_token_ = wakeup_token + 1;
