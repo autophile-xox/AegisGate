@@ -76,6 +76,22 @@ TEST_F(ConfigTest, RejectsInvalidGroupsAndSmoothing) {
     }
 }
 
+TEST_F(ConfigTest, ValidatesHealthAndCircuitOptions) {
+    const std::string base = "listen 127.0.0.1 8080\nbackend one 127.0.0.1 9000 8 4 2\nroute * / one\n";
+    const auto defaults = load(base);
+    EXPECT_FALSE(defaults.circuit.enabled);
+    EXPECT_EQ(defaults.health.interval.count(), 0);
+    const auto config = load(base + "circuit_breaker on\nhealth_path /ready\nhealth_interval_ms 100\n");
+    EXPECT_TRUE(config.circuit.enabled);
+    EXPECT_EQ(config.health.path, "/ready");
+    EXPECT_EQ(config.health.interval.count(), 100);
+    for (const auto* line : {"circuit_window 2\ncircuit_min_samples 3\n",
+                            "circuit_failure_percent 101\n", "circuit_max_probes 0\n",
+                            "health_path /ready?check=true\n", "health_successes 0\n"}) {
+        EXPECT_THROW(load(base + line), std::runtime_error);
+    }
+}
+
 TEST(Config, NormalizesHostAndValidatesAuthority) {
     EXPECT_EQ(aegisgate::normalize_host("Test.Example:8080"), "test.example");
     EXPECT_EQ(aegisgate::normalize_host("[0:0:0:0:0:0:0:1]:80"), "[::1]");

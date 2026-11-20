@@ -390,6 +390,27 @@ class GatewayTests(unittest.TestCase):
                       self.gateway.log.read_text())
         self.assertEqual(self.one.requests, ["/hold"])
 
+    def test_refused_upstream_connection_opens_circuit(self):
+        with socket.socket() as unavailable:
+            unavailable.bind((HOST, 0))
+            self.start(backends={"unavailable": unavailable.getsockname()[1]},
+                       options={"circuit_breaker": "on", "circuit_min_samples": 1},
+                       routes="route * / unavailable\n")
+            self.assertEqual(self.get()[0], 502)
+            self.assertEqual(self.get()[0], 503)
+            self.assertIn("backend=unavailable circuit=closed->open reason=transport_error",
+                          self.gateway.log.read_text())
+
+    def test_cancelled_application_request_does_not_open_circuit(self):
+        self.start(pool="1 0 1", options={"circuit_breaker": "on", "circuit_min_samples": 1})
+        with self.wire() as wire:
+            wire.send(request("/hold"))
+            self.assertTrue(self.one.entered.wait(2))
+            wire.socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        eventually(lambda: self.gateway.fd_count() == self.baseline)
+        self.assertEqual(self.get("/still-healthy")[2], b"one:/still-healthy")
+        self.assertNotIn("circuit=closed->open", self.gateway.log.read_text())
+
     def test_active_health_isolates_and_recovers_an_endpoint(self):
         two = Backend("two")
         self.addCleanup(two.close)
