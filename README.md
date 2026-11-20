@@ -2,6 +2,8 @@
 
 AegisGate is a Linux C++20 reverse proxy for routing HTTP/1.1 requests by host and path. It streams HTTP bodies through bounded buffers, steers traffic around slower or unhealthy backends, and shares rate limits across replicas through Redis.
 
+Healthy traffic should continue when a single origin slows down, and admission decisions across gateway replicas need a common budget. AegisGate combines worker-local connection ownership and resilience with Redis-authorized token leases.
+
 ~~~mermaid
 flowchart LR
     C[HTTP/1.1 clients] --> L[Worker listeners with SO_REUSEPORT]
@@ -17,6 +19,30 @@ flowchart LR
     Q --> S[Latency and circuit state]
     S --> B
 ~~~
+
+The Stage 1 stack uses C++20, Linux epoll, llhttp, hiredis, Redis Lua, a Go origin simulator, Prometheus, Grafana, Docker Compose, and GitHub Actions. [Architecture and request state machine](docs/architecture.md)
+
+## Start the full demo
+
+Use a Linux Docker engine with Compose. From the repository root, generate a demo key and start both gateways, two origins, Redis, Prometheus, and Grafana.
+
+~~~bash
+export AEGISGATE_DEMO_TENANT_KEY="$(openssl rand -hex 24)"
+docker compose up -d --build --wait
+curl -fsS -H "X-API-Key: $AEGISGATE_DEMO_TENANT_KEY" http://127.0.0.1:8080/data
+curl -fsS -H "X-API-Key: $AEGISGATE_DEMO_TENANT_KEY" http://127.0.0.1:8081/data
+python3 scripts/verify-compose.py
+docker compose ps
+~~~
+
+Open the AegisGate Stage 1 dashboard on loopback at port 3000. Prometheus is available at port 9090. Both gateways use the same demo quota and Redis namespace. The `/limited` route adds a smaller route quota for testing rejection behavior. [Grafana dashboard](http://127.0.0.1:3000/d/aegisgate-overview/aegisgate-stage-1) · [Prometheus targets](http://127.0.0.1:9090/targets)
+
+~~~bash
+docker compose logs gateway-a gateway-b
+docker compose down
+~~~
+
+The demo uses subnet `172.29.45.0/24`. If it overlaps an existing local network, change the subnet and fixed service addresses in the Compose and gateway configuration together. Host ports are loopback-only. Redis and gateway metrics stay on the Docker network, and Grafana provides an anonymous viewer for the demo.
 
 ## Build and run
 
@@ -84,7 +110,11 @@ The single-backend configuration keeps both the breaker and active checks disabl
 
 ## Protocol scope
 
-Clients use plaintext HTTP/1.1 with origin-form targets. HTTP/1.0 backend responses are supported, with each connection retired after the exchange. Close-delimited responses are re-encoded as chunked downstream. TLS, protocol upgrades, CONNECT tunnels, informational responses, and Expect negotiation are outside M1. [HTTP/1.1 message framing](https://www.rfc-editor.org/rfc/rfc9112.html)
+Clients use plaintext HTTP/1.1 with origin-form targets. HTTP/1.0 backend responses are supported, with each connection retired after the exchange. Close-delimited responses are re-encoded as chunked downstream. Stage 1 excludes TLS, protocol upgrades, CONNECT tunnels, informational responses, and Expect negotiation. [HTTP/1.1 message framing](https://www.rfc-editor.org/rfc/rfc9112.html)
+
+## Observability
+
+Add `metrics_listen 127.0.0.1 9091` to expose a separate HTTP listener with `/metrics` and `/healthz`. Prometheus derives throughput from monotonic counters. Request, route, upstream, and Redis histograms support percentiles. Worker-local resilience gauges preserve the per-worker circuit view. Process CPU, RSS, and file descriptor collection runs on the metrics thread. [Metric configuration and live verification](docs/architecture.md)
 
 ## Distributed rate limiting
 
@@ -115,15 +145,15 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DAEGISGATE_SANITIZERS=ON
 cmake --build build-asan --parallel
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
   ctest --test-dir build-asan --output-on-failure
+
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DAEGISGATE_TSAN=ON
+cmake --build build-tsan --parallel
+TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
 ~~~
 
-The M1 benchmark uses `wrk` on Linux loopback with a fixed-response Python origin and persistent connections. Adjust the `taskset` CPU IDs for your host. The command writes raw output and a JSON report under the ignored benchmark directory.
+Install Redis server and CLI to include the Redis suites in CTest. The WSL2 verification run used a process-local ASLR override for TSan. [Verified test commands](PROJECT_PROGRESS.md#test-status)
 
-~~~bash
-python3 benchmarks/m1_smoke.py --gateway build/aegisgate \
-  --output .local/benchmark-results/m1-loopback \
-  --origin-cpu 2 --gateway-cpus 4,6 --load-cpus 8,10 --soak 30
-~~~
+GitHub Actions runs Debug, Release, ASan/UBSan, separate TSan, Go analysis and tests, and live Compose verification. The constant-rate harnesses cover forwarding overhead, balancing, breaker behavior, rate-limit overhead, Redis efficiency, shared quotas, and endurance. Raw results are written to Git-ignored paths. [Stage 1 benchmark commands](docs/benchmarks.md) · [GitHub Actions](https://github.com/autophile-xox/AegisGate/actions/workflows/stage-one.yml)
 
 ## Go upstream simulator
 
@@ -158,15 +188,6 @@ curl -fsS http://127.0.0.1:9101/stats
 curl -fsS -H 'Content-Type: application/json' -d '{"delay_ms":1}' http://127.0.0.1:9101/faults
 ~~~
 
-### Reproduce the M2 comparison
+## Stage 2 roadmap
 
-The benchmark alternates three fixed-rate trials per policy, with the same healthy warmup and the same delayed origin. It also runs an application 503 phase, stops both listeners, and measures recovery after they reopen. Latency percentiles use successful responses, and HTTP and transport failures are counted separately. Adjust the Linux CPU IDs to match your host and choose a fresh output directory for each run.
-
-~~~bash
-taskset -c 8,10 python3 benchmarks/m2_resilience.py \
-  --gateway build/aegisgate --simulator build/upstream-simulator \
-  --output .local/benchmark-results/m2-resilience \
-  --fast-cpu 2 --gateway-cpu 4 --slow-cpu 6
-~~~
-
-Redis and the simulator are included in the reproducible [M3 benchmark](docs/rate-limiting.md#verification-and-measurement). Exported metrics, deployment, CI, and expanded benchmarking follow in M4. [Project progress](PROJECT_PROGRESS.md)
+Stage 1 assumes trusted plaintext numeric origins and Redis endpoints. Future work includes TLS termination, HTTP/2, dynamic configuration, authenticated Redis transports, and testing under replicated Redis failover and cross-host load. [Current project status and limitations](PROJECT_PROGRESS.md)
