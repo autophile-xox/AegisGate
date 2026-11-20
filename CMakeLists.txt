@@ -27,7 +27,8 @@ FetchContent_MakeAvailable(llhttp)
 target_compile_options(llhttp_static PRIVATE -fexceptions)
 find_package(Threads REQUIRED)
 
-add_library(aegisgate_core STATIC src/core/config.cpp src/http/message.cpp src/routing/balancer.cpp)
+add_library(aegisgate_core STATIC src/core/config.cpp src/http/message.cpp src/routing/balancer.cpp
+    src/resilience/circuit_breaker.cpp)
 target_include_directories(aegisgate_core PUBLIC include)
 target_link_libraries(aegisgate_core PUBLIC llhttp::llhttp)
 target_compile_options(aegisgate_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -50,7 +51,7 @@ if(BUILD_TESTING)
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
     add_executable(aegisgate_unit tests/unit/message_test.cpp tests/unit/config_test.cpp
-        tests/unit/balancer_test.cpp)
+        tests/unit/balancer_test.cpp tests/unit/circuit_breaker_test.cpp)
     target_link_libraries(aegisgate_unit PRIVATE aegisgate_core GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(aegisgate_unit DISCOVERY_MODE PRE_TEST)

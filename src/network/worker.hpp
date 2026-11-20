@@ -4,6 +4,7 @@
 
 #include "aegisgate/config.hpp"
 #include "aegisgate/http/message.hpp"
+#include "aegisgate/resilience/circuit_breaker.hpp"
 #include "aegisgate/routing/balancer.hpp"
 
 #include <array>
@@ -66,6 +67,7 @@ private:
         std::size_t backend{};
         std::optional<Queue::iterator> pending;
         std::optional<Deadlines::iterator> timer;
+        std::optional<CircuitBreaker::Permit> permit;
         Time header_deadline{never};
         Time exchange_deadline{never};
         Time read_deadline{never};
@@ -97,6 +99,8 @@ private:
     };
 
     struct Pool {
+        explicit Pool(const CircuitSettings& settings) : breaker(settings) {}
+        CircuitBreaker breaker;
         Queue idle;
         Queue pending;
         std::size_t count{};
@@ -112,7 +116,7 @@ private:
     void pump_request(Token token, Client& client);
     void read_response(Client& client, Upstream& upstream, bool hangup);
     void finish_response(Client& client, bool reusable);
-    void fail(Client& client, int status);
+    void fail(Client& client, int status, AttemptOutcome outcome = AttemptOutcome::cancelled);
     void clear_exchange(Client& client);
     void settle(Token token);
 
@@ -125,9 +129,11 @@ private:
 
     void admit(Token token, Client& client);
     [[nodiscard]] std::optional<std::size_t> choose_backend(std::size_t group);
+    [[nodiscard]] bool eligible(std::size_t backend) const;
     [[nodiscard]] bool capacity(std::size_t backend) const;
     void assign(Token token, Client& client);
-    void account_attempt(Client& client, std::optional<Clock::duration> latency);
+    void account_attempt(Client& client, AttemptOutcome outcome);
+    void log_transition(std::size_t backend, CircuitState previous, std::string_view reason);
     void release(Client& client, bool reusable);
     void retire(Token upstream);
     void schedule(std::size_t backend);
@@ -135,6 +141,7 @@ private:
 
     const Config& config_;
     const int failure_event_;
+    const std::size_t worker_id_;
     Fd epoll_;
     Fd wakeup_;
     WatchedFd listener_;

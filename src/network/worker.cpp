@@ -93,11 +93,14 @@ Worker::Client::Client(Fd fd, const Config& config)
       response(HTTP_RESPONSE, config.header_bytes, config.body_bytes) {}
 
 Worker::Worker(const Config& config, int failure_event, std::size_t worker_id)
-    : config_(config), failure_event_(failure_event),
+    : config_(config), failure_event_(failure_event), worker_id_(worker_id),
       epoll_(checked_fd(epoll_create1(EPOLL_CLOEXEC), "epoll_create1")),
       wakeup_(checked_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC), "worker eventfd")),
-      listener_(open_listener(config.listener)), pools_(config.backends.size()),
-      balancer_(config, worker_id + 1) {
+      listener_(open_listener(config.listener)), balancer_(config, worker_id + 1) {
+    pools_.reserve(config.backends.size());
+    for (std::size_t i = 0; i < config.backends.size(); ++i) {
+        pools_.emplace_back(config.circuit);
+    }
     listener_.watch(epoll_.get(), listener_token, EPOLLIN);
     epoll_event event{};
     event.events = EPOLLIN;
@@ -348,7 +351,7 @@ void Worker::on_upstream(Token token, std::uint32_t events) {
     auto& client = clients_.at(owner);
     if (upstream.connecting()) {
         if (socket_error(upstream.socket.fd.get()) != 0) {
-            fail(client, 502);
+            fail(client, 502, AttemptOutcome::transport_error);
             settle(owner);
             return;
         }
@@ -362,7 +365,7 @@ void Worker::on_upstream(Token token, std::uint32_t events) {
         return;
     }
     if (events & EPOLLERR) {
-        fail(client, 502);
+        fail(client, 502, AttemptOutcome::transport_error);
     } else if ((events & EPOLLOUT) && !client.to_upstream.empty()) {
         const auto data = client.to_upstream.view().substr(0, io_bytes);
         const auto written = send(upstream.socket.fd.get(), data.data(), data.size(), MSG_NOSIGNAL);
@@ -371,7 +374,7 @@ void Worker::on_upstream(Token token, std::uint32_t events) {
             client.to_upstream.consume(static_cast<std::size_t>(written));
             pump_request(owner, client);
         } else if (written < 0 && !transient_io()) {
-            fail(client, 502);
+            fail(client, 502, AttemptOutcome::transport_error);
         }
     }
     settle(owner);
@@ -381,14 +384,15 @@ void Worker::read_response(Client& client, Upstream& upstream, bool hangup) {
     const auto received = recv(upstream.socket.fd.get(), scratch_.data(), response_read_size(client), 0);
     if (received < 0) {
         if (!transient_io()) {
-            fail(client, 502);
+            fail(client, 502, AttemptOutcome::transport_error);
         }
         return;
     }
     if (received == 0) {
         client.response.finish();
         if (client.response.error_status()) {
-            fail(client, 502);
+            fail(client, 502, client.response.started() ? AttemptOutcome::invalid_response
+                                                        : AttemptOutcome::transport_error);
         } else {
             client.output.append_body(client.response, 0, config_.stream_buffer_bytes);
             finish_response(client, false);
@@ -396,14 +400,14 @@ void Worker::read_response(Client& client, Upstream& upstream, bool hangup) {
         return;
     }
     if (!client.request_sent) {
-        fail(client, 502);
+        fail(client, 502, AttemptOutcome::invalid_response);
         return;
     }
     const auto had_headers = client.response.has_headers();
     const auto size = static_cast<std::size_t>(received);
     const auto used = client.response.consume({scratch_.data(), size});
     if (client.response.error_status()) {
-        fail(client, 502);
+        fail(client, 502, AttemptOutcome::invalid_response);
         return;
     }
     if (!had_headers && client.response.has_headers()) {
@@ -426,15 +430,15 @@ void Worker::read_response(Client& client, Upstream& upstream, bool hangup) {
 }
 
 void Worker::finish_response(Client& client, bool reusable) {
-    const auto sample = client.response.status() < 500
-        ? std::optional(client.response_headers_at - client.attempt_started) : std::nullopt;
-    account_attempt(client, sample);
+    account_attempt(client, client.response.status() < 500 ? AttemptOutcome::success
+                                                           : AttemptOutcome::upstream_5xx);
     release(client, reusable);
     client.exchange_deadline = never;
     client.terminal = true;
 }
 
-void Worker::fail(Client& client, int status) {
+void Worker::fail(Client& client, int status, AttemptOutcome outcome) {
+    account_attempt(client, outcome);
     release(client, false);
     client.exchange_deadline = client.header_deadline = never;
     client.to_upstream.clear();
@@ -569,7 +573,10 @@ bool Worker::expire_client(Token token) {
             client.dead = true;
         }
     } else {
-        fail(client, 504);
+        const bool upstream_wait = client.upstream != 0 &&
+            (upstreams_.at(client.upstream).connecting() ||
+             ((client.request.complete() || client.upload_cancelled) && response_read_size(client) != 0));
+        fail(client, 504, upstream_wait ? AttemptOutcome::timeout : AttemptOutcome::cancelled);
     }
     settle(token);
     return true;
@@ -595,14 +602,25 @@ bool Worker::capacity(std::size_t backend) const {
     return !pool.idle.empty() || pool.count < config_.backends[backend].connections;
 }
 
+bool Worker::eligible(std::size_t backend) const {
+    return pools_[backend].breaker.available(now_);
+}
+
 std::optional<std::size_t> Worker::choose_backend(std::size_t group) {
     std::array<std::size_t, 64> ready;
     std::array<std::size_t, 64> queued;
     std::size_t ready_count = 0;
     std::size_t queued_count = 0;
     for (const auto backend : config_.groups[group].backends) {
+        if (!eligible(backend)) {
+            continue;
+        }
         const auto& pool = pools_[backend];
         if (pool.pending.empty() && capacity(backend)) {
+            // Give a cooled circuit bounded trial traffic, even if its old latency was high.
+            if (pool.breaker.state() != CircuitState::closed) {
+                return backend;
+            }
             ready[ready_count++] = backend;
         } else if (pool.pending.size() < config_.backends[backend].pending) {
             queued[queued_count++] = backend;
@@ -630,10 +648,17 @@ void Worker::admit(Token token, Client& client) {
 }
 
 void Worker::assign(Token token, Client& client) {
+    auto& pool = pools_[client.backend];
+    const auto previous = pool.breaker.state();
+    client.permit = pool.breaker.acquire(now_);
+    if (!client.permit) {
+        fail(client, 503);
+        return;
+    }
+    log_transition(client.backend, previous, "cooldown_elapsed");
     balancer_.begin(client.backend);
     client.attempt_started = now_;
     client.response_headers_at = never;
-    auto& pool = pools_[client.backend];
     if (!pool.idle.empty()) {
         const auto idle = pool.idle.back();
         auto& upstream = upstreams_.at(idle);
@@ -658,7 +683,7 @@ void Worker::assign(Token token, Client& client) {
     auto connect_deadline = never;
     if (connect(fd.get(), address, endpoint.length) < 0) {
         if (errno != EINPROGRESS && errno != EINTR) {
-            fail(client, 502);
+            fail(client, 502, AttemptOutcome::transport_error);
             return;
         }
         connect_deadline = now_ + config_.connect_timeout;
@@ -669,15 +694,41 @@ void Worker::assign(Token token, Client& client) {
     client.upstream = upstream;
 }
 
-void Worker::account_attempt(Client& client, std::optional<Clock::duration> latency) {
-    if (client.attempt_started != never) {
-        balancer_.finish(client.backend, latency, now_);
-        client.attempt_started = never;
+void Worker::account_attempt(Client& client, AttemptOutcome outcome) {
+    if (!client.permit) {
+        return;
+    }
+    std::optional<Clock::duration> latency;
+    if (outcome == AttemptOutcome::success) {
+        latency = client.response_headers_at - client.attempt_started;
+    } else if (outcome != AttemptOutcome::cancelled) {
+        // A quick rejection is a failed attempt, never a fast latency sample.
+        latency = std::max(config_.latency.initial, config_.response_timeout);
+    }
+    auto& breaker = pools_[client.backend].breaker;
+    const auto previous = breaker.state();
+    breaker.complete(*client.permit, outcome, now_);
+    if (previous == CircuitState::half_open && breaker.state() == CircuitState::closed) {
+        balancer_.reset_latency(client.backend);
+    }
+    balancer_.finish(client.backend, latency, now_);
+    log_transition(client.backend, previous, name(outcome));
+    client.permit.reset();
+    schedule(client.backend);
+}
+
+void Worker::log_transition(std::size_t backend, CircuitState previous, std::string_view reason) {
+    const auto current = pools_[backend].breaker.state();
+    if (current != previous) {
+        const auto tick = std::chrono::duration_cast<std::chrono::milliseconds>(now_.time_since_epoch());
+        std::osyncstream(std::cerr) << "worker=" << worker_id_ << " backend=" << config_.backends[backend].name
+            << " circuit=" << name(previous) << "->" << name(current)
+            << " reason=" << reason << " monotonic_ms=" << tick.count() << '\n';
     }
 }
 
 void Worker::release(Client& client, bool reusable) {
-    account_attempt(client, std::nullopt);
+    account_attempt(client, AttemptOutcome::cancelled);
     auto& pool = pools_[client.backend];
     if (client.pending) {
         pool.pending.erase(*client.pending);
@@ -713,7 +764,7 @@ void Worker::retire(Token token) {
 
 void Worker::schedule(std::size_t backend) {
     auto& pool = pools_[backend];
-    if (!pool.scheduled && !pool.pending.empty() && capacity(backend)) {
+    if (!pool.scheduled && !pool.pending.empty() && (!eligible(backend) || capacity(backend))) {
         pool.scheduled = true;
         dispatch_queue_.push_back(backend);
     }
@@ -725,7 +776,8 @@ void Worker::dispatch() {
         dispatch_queue_.pop_front();
         auto& pool = pools_[backend];
         pool.scheduled = false;
-        if (pool.pending.empty() || !capacity(backend)) {
+        const auto available = eligible(backend);
+        if (pool.pending.empty() || (available && !capacity(backend))) {
             continue;
         }
         const auto token = pool.pending.front();
@@ -734,6 +786,8 @@ void Worker::dispatch() {
         client.pending.reset();
         if (client.exchange_deadline <= now_) {
             fail(client, 504);
+        } else if (!available) {
+            fail(client, 503);
         } else {
             assign(token, client);
             pump_request(token, client);

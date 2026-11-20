@@ -13,7 +13,15 @@ using Microseconds = std::chrono::duration<double, std::micro>;
 
 Balancer::Balancer(const Config& config, std::size_t seed)
     : config_(config), loads_(config.backends.size()), cursors_(config.groups.size()),
-      random_(seed) {}
+      random_(seed) {
+    for (const auto& group : config.groups) {
+        if (group.policy == BalancePolicy::peak_ewma) {
+            for (const auto backend : group.backends) {
+                loads_[backend].measure = true;
+            }
+        }
+    }
+}
 
 std::size_t Balancer::choose(std::size_t group, std::span<const std::size_t> eligible, Time now) {
     assert(!eligible.empty());
@@ -51,7 +59,7 @@ void Balancer::finish(std::size_t backend, std::optional<Clock::duration> sample
     auto& load = loads_[backend];
     assert(load.active != 0);
     --load.active;
-    if (!sample) {
+    if (!sample || !load.measure) {
         return;
     }
     const auto measured = std::max(1.0, Microseconds(*sample).count());
@@ -63,6 +71,10 @@ void Balancer::finish(std::size_t backend, std::optional<Clock::duration> sample
         load.latency_us = std::max(measured, old * load.latency_us + (1.0 - old) * measured);
     }
     load.last_sample = now;
+}
+
+void Balancer::reset_latency(std::size_t backend) {
+    loads_[backend].last_sample.reset();
 }
 
 double Balancer::weight(Clock::duration age) const {

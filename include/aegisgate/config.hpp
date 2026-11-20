@@ -44,6 +44,16 @@ struct LatencySettings {
     std::chrono::milliseconds initial{10};
 };
 
+struct CircuitSettings {
+    bool enabled{};
+    std::size_t window{16};
+    std::size_t min_samples{4};
+    std::size_t failure_percent{50};
+    std::chrono::milliseconds cooldown{1000};
+    std::size_t max_probes{1};
+    std::size_t recovery_successes{2};
+};
+
 struct Config {
     Endpoint listener;
     std::size_t workers = 2;
@@ -57,6 +67,7 @@ struct Config {
     std::chrono::milliseconds response_timeout{10000};
     std::chrono::milliseconds shutdown_timeout{5000};
     LatencySettings latency;
+    CircuitSettings circuit;
     std::vector<Backend> backends;
     std::vector<BackendGroup> groups;
     std::vector<Route> routes;

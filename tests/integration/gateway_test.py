@@ -100,6 +100,7 @@ class Backend(http.server.ThreadingHTTPServer):
         super().__init__((HOST, 0), Handler)
         self.label = name.encode()
         self.delay = delay
+        self.status = 200
         self.lock = threading.Lock()
         self.accepted = 0
         self.requests = []
@@ -153,7 +154,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.record()
         if self.server.delay:
             time.sleep(self.server.delay)
-        if self.path == "/no-content":
+        if self.server.status != 200:
+            self.fixed(self.server.label + b" failure", self.server.status)
+        elif self.path == "/no-content":
             self.send_response(204)
             self.end_headers()
         elif self.path == "/hold":
@@ -284,6 +287,11 @@ class GatewayTests(unittest.TestCase):
     def wire(self, receive_buffer=None):
         return Wire(self.port, receive_buffer)
 
+    def get(self, path="/"):
+        with self.wire() as wire:
+            wire.send(request(path))
+            return wire.response()
+
     def test_named_group_round_robin_routes_in_order(self):
         two = Backend("two")
         self.addCleanup(two.close)
@@ -307,6 +315,65 @@ class GatewayTests(unittest.TestCase):
             for _ in range(12):
                 wire.send(request("/balance"))
                 self.assertEqual(wire.response()[2], b"one:/balance")
+
+    def test_fast_503_opens_circuit_and_recovery_requires_successful_trials(self):
+        two = Backend("two")
+        self.addCleanup(two.close)
+        self.start(backends={"two": two.server_port},
+                   options={"circuit_breaker": "on", "circuit_min_samples": 2,
+                            "circuit_cooldown_ms": 350, "circuit_recovery_successes": 2},
+                   routes="group api peak_ewma one two\nroute * / api\nroute * /one one\n")
+        self.one.status = 503
+        for _ in range(2):
+            status, _, body = self.get("/one")
+            self.assertEqual((status, body), (503, b"one failure"))
+        self.assertIn("backend=one circuit=closed->open reason=upstream_5xx",
+                      self.gateway.log.read_text())
+        self.assertEqual(self.get("/one")[2], b"")
+        for _ in range(6):
+            self.assertEqual(self.get("/healthy")[2], b"two:/healthy")
+        self.assertEqual(self.one.requests, ["/one", "/one"])
+
+        time.sleep(0.37)
+        self.assertEqual(self.get("/one")[2], b"one failure")
+        self.assertIn("backend=one circuit=half_open->open reason=upstream_5xx",
+                      self.gateway.log.read_text())
+        self.assertEqual(self.get("/one")[2], b"")
+        self.one.status = 200
+        time.sleep(0.37)
+        self.assertEqual(self.get("/one")[0], 200)
+        self.assertNotIn("backend=one circuit=half_open->closed", self.gateway.log.read_text())
+        self.assertEqual(self.get("/one")[0], 200)
+        self.assertIn("backend=one circuit=half_open->closed reason=success",
+                      self.gateway.log.read_text())
+
+    def test_all_circuits_open_returns_gateway_503(self):
+        two = Backend("two")
+        self.addCleanup(two.close)
+        two.status = 500
+        self.start(backends={"two": two.server_port},
+                   options={"circuit_breaker": "on", "circuit_min_samples": 1},
+                   routes="group api round_robin one two\nroute * / api\n")
+        self.one.status = 503
+        self.assertEqual(self.get()[0], 503)
+        self.assertEqual(self.get()[0], 500)
+        self.assertEqual(self.get()[::2], (503, b""))
+        self.assertEqual(self.one.requests, ["/"])
+        self.assertEqual(two.requests, ["/"])
+
+    def test_upstream_timeout_opens_circuit_and_rejects_queued_request(self):
+        self.start(pool="1 0 1", options={"circuit_breaker": "on",
+                                       "circuit_min_samples": 1, "response_timeout_ms": 350})
+        with self.wire() as active, self.wire() as queued:
+            active.send(request("/hold"))
+            self.assertTrue(self.one.entered.wait(2))
+            time.sleep(0.08)
+            queued.send(request("/queued"))
+            self.assertEqual(active.response()[0], 504)
+            self.assertEqual(queued.response()[0], 503)
+        self.assertIn("backend=one circuit=closed->open reason=timeout",
+                      self.gateway.log.read_text())
+        self.assertEqual(self.one.requests, ["/hold"])
 
     def test_routes_by_host_then_path_and_returns_404(self):
         two = Backend("two")

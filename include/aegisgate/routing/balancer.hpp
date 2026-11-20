@@ -17,12 +17,14 @@ public:
                                      Time now);
     void begin(std::size_t backend);
     void finish(std::size_t backend, std::optional<Clock::duration> sample, Time now);
+    void reset_latency(std::size_t backend);
 
 private:
     struct BackendLoad {
         std::optional<Time> last_sample;
         double latency_us{};
         std::size_t active{};
+        bool measure{};
     };
 
     [[nodiscard]] double weight(Clock::duration age) const;

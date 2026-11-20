@@ -237,6 +237,23 @@ Config load_config(const std::filesystem::path& path) {
                 config.latency.stale = milliseconds();
             } else if (key == "ewma_initial_ms") {
                 config.latency.initial = milliseconds();
+            } else if (key == "circuit_breaker") {
+                if (value != "on" && value != "off") {
+                    throw std::runtime_error("circuit_breaker must be on or off");
+                }
+                config.circuit.enabled = value == "on";
+            } else if (key == "circuit_window") {
+                config.circuit.window = number(value, 1, 1024);
+            } else if (key == "circuit_min_samples") {
+                config.circuit.min_samples = number(value, 1, 1024);
+            } else if (key == "circuit_failure_percent") {
+                config.circuit.failure_percent = number(value, 1, 100);
+            } else if (key == "circuit_cooldown_ms") {
+                config.circuit.cooldown = milliseconds();
+            } else if (key == "circuit_max_probes") {
+                config.circuit.max_probes = number(value, 1, 64);
+            } else if (key == "circuit_recovery_successes") {
+                config.circuit.recovery_successes = number(value, 1, 64);
             } else {
                 throw std::runtime_error("unknown setting " + key);
             }
@@ -257,6 +274,9 @@ Config load_config(const std::filesystem::path& path) {
     }
     if (config.latency.stale < config.latency.decay) {
         throw std::runtime_error("ewma_stale_ms must be at least ewma_decay_ms");
+    }
+    if (config.circuit.min_samples > config.circuit.window) {
+        throw std::runtime_error("circuit_min_samples must fit inside circuit_window");
     }
 
     // Each backend name is also an implicit single-backend group for existing configs.
