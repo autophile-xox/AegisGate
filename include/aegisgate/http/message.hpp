@@ -73,7 +73,7 @@ private:
     std::string protocol_;
     std::string reason_;
     std::string body_;
-    Header trailer_;
+    std::string trailer_name_;
     std::vector<Header> headers_;
     std::vector<std::string> connection_options_;
 };

@@ -69,6 +69,7 @@ private:
         Time exchange_deadline{never};
         Time read_deadline{never};
         Time write_deadline{never};
+        Time linger_deadline{never};
         bool engaged{};
         bool terminal{};
         bool close_after{};
@@ -116,6 +117,7 @@ private:
     [[nodiscard]] std::size_t response_read_size(const Client& client) const;
     [[nodiscard]] int wait_time() const;
     void expire();
+    [[nodiscard]] bool expire_client(Token token);
     void update_deadline(Token token, Client& client, Time connect_deadline);
 
     void admit(Token token, Client& client);

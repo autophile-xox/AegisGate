@@ -49,4 +49,8 @@ if(BUILD_TESTING)
     target_link_libraries(aegisgate_unit PRIVATE aegisgate_core GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(aegisgate_unit DISCOVERY_MODE PRE_TEST)
+    find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME gateway_integration COMMAND Python3::Interpreter
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/gateway_test.py" $<TARGET_FILE:aegisgate> -v)
+    set_tests_properties(gateway_integration PROPERTIES TIMEOUT 90)
 endif()

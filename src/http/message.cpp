@@ -81,7 +81,7 @@ const llhttp_settings_t Message::settings_ = [] {
     };
     settings.on_header_field = [](llhttp_t* parser, const char* at, std::size_t length) {
         auto& message = self(parser);
-        if (message.headers_.empty()) {
+        if (!message.headers_complete_ && message.headers_.empty()) {
             message.headers_.emplace_back();
         }
         if (message.headers_complete_) {
@@ -90,7 +90,7 @@ const llhttp_settings_t Message::settings_ = [] {
                 return static_cast<int>(HPE_USER);
             }
         }
-        auto& name = message.headers_complete_ ? message.trailer_.name
+        auto& name = message.headers_complete_ ? message.trailer_name_
                                                : message.headers_.back().name;
         for (std::size_t i = 0; i < length; ++i) {
             if (!token_char(static_cast<unsigned char>(at[i]))) {
@@ -103,7 +103,7 @@ const llhttp_settings_t Message::settings_ = [] {
     settings.on_header_field_complete = [](llhttp_t* parser) {
         const auto& message = self(parser);
         if (message.headers_complete_) {
-            const auto& name = message.trailer_.name;
+            const auto& name = message.trailer_name_;
             if (framing_header(name) || hop_header(name) || name == "host") {
                 return -1;
             }
@@ -126,7 +126,7 @@ const llhttp_settings_t Message::settings_ = [] {
         auto& message = self(parser);
         if (message.headers_complete_) {
             message.trailer_bytes_ += 3;
-            message.trailer_.name.clear();
+            message.trailer_name_.clear();
             return message.trailer_bytes_ <= message.header_limit_ ? 0 : -1;
         }
         message.headers_.emplace_back();
@@ -176,7 +176,7 @@ void Message::reset(bool head_response) {
     protocol_.clear();
     reason_.clear();
     body_.clear();
-    trailer_.name.clear();
+    trailer_name_.clear();
     headers_.clear();
     connection_options_.clear();
 }

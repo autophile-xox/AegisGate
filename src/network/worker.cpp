@@ -17,14 +17,14 @@ constexpr std::uint32_t read_ready = read_events | EPOLLHUP | EPOLLERR;
 
 Fd open_listener(const Endpoint& endpoint) {
     const auto* address = reinterpret_cast<const sockaddr*>(&endpoint.address);
-    auto fd = checked_fd(socket(address->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0),
-                         "listener socket");
+    auto fd = checked_fd(socket(endpoint.address.ss_family,
+                                SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0), "listener socket");
     const int enabled = 1;
     check_syscall(setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)),
                   "SO_REUSEADDR");
     check_syscall(setsockopt(fd.get(), SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)),
                   "SO_REUSEPORT");
-    if (address->sa_family == AF_INET6) {
+    if (endpoint.address.ss_family == AF_INET6) {
         check_syscall(setsockopt(fd.get(), IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof(enabled)),
                       "IPV6_V6ONLY");
     }
@@ -217,10 +217,23 @@ bool Worker::can_read_client(const Client& client) const {
 }
 
 void Worker::on_client(Token token, std::uint32_t events) {
+    if (expire_client(token)) {
+        return;
+    }
     auto& client = clients_.at(token);
     if ((events & (EPOLLERR | EPOLLHUP)) || (draining_ && !client.engaged)) {
         client.dead = true;
         settle(token);
+        return;
+    }
+    if (client.linger_deadline != never) {
+        if (events & read_events) {
+            const auto received = recv(client.socket.fd.get(), scratch_.data(), scratch_.size(), 0);
+            if (received == 0 || (received < 0 && !transient_io())) {
+                client.dead = true;
+                settle(token);
+            }
+        }
         return;
     }
     if ((events & EPOLLOUT) && !client.output.empty()) {
@@ -274,8 +287,8 @@ void Worker::pump_request(Token token, Client& client) {
         if (!client.request.started()) {
             client.header_deadline = now_ + config_.header_timeout;
         }
-        const auto consumed = client.request.consume(client.input.view().substr(0,
-                                                                                 remaining - framing_room));
+        const auto bytes = client.input.view().substr(0, remaining - framing_room);
+        const auto consumed = client.request.consume(bytes);
         client.input.consume(consumed);
         if (client.request.error_status()) {
             fail(client, client.request.error_status());
@@ -323,6 +336,9 @@ void Worker::on_upstream(Token token, std::uint32_t events) {
         return;
     }
     const auto owner = upstream.client;
+    if (expire_client(owner)) {
+        return;
+    }
     auto& client = clients_.at(owner);
     if (upstream.connecting()) {
         if (socket_error(upstream.socket.fd.get()) != 0) {
@@ -439,9 +455,17 @@ void Worker::clear_exchange(Client& client) {
 void Worker::settle(Token token) {
     auto iterator = clients_.find(token);
     auto& client = iterator->second;
-    if (!client.dead && client.terminal && client.output.empty()) {
+    if (!client.dead && client.terminal && client.output.empty() && client.linger_deadline == never) {
         if (draining_ || client.close_after) {
-            client.dead = true;
+            // Send FIN after the response, then discard unread inbound data for a short period.
+            // Closing with unread TCP data can reset the connection and hide the error response.
+            if (shutdown(client.socket.fd.get(), SHUT_WR) < 0) {
+                client.dead = true;
+            } else {
+                client.input.clear();
+                client.linger_deadline = now_ + std::min(config_.client_idle,
+                                                         std::chrono::milliseconds(200));
+            }
         } else {
             clear_exchange(client);
             pump_request(token, client);
@@ -459,6 +483,9 @@ void Worker::settle(Token token) {
         return;
     }
     std::uint32_t desired = client.peer_fin ? 0U : EPOLLRDHUP;
+    if (client.linger_deadline != never) {
+        desired |= EPOLLIN;
+    }
     if (can_read_client(client)) {
         desired |= EPOLLIN;
         if (client.read_deadline == never) {
@@ -495,7 +522,7 @@ void Worker::settle(Token token) {
 
 void Worker::update_deadline(Token token, Client& client, Time connect_deadline) {
     const auto deadline = std::min({client.header_deadline, client.read_deadline,
-        client.write_deadline, client.exchange_deadline, connect_deadline});
+        client.write_deadline, client.exchange_deadline, connect_deadline, client.linger_deadline});
     if (client.timer) {
         if ((*client.timer)->first == deadline) {
             return;
@@ -514,20 +541,28 @@ void Worker::expire() {
         if (deadline > now_) {
             return;
         }
-        auto& client = clients_.at(token);
-        if (client.write_deadline <= now_) {
-            client.dead = true;
-        } else if (client.header_deadline <= now_ || client.read_deadline <= now_) {
-            if (client.request.started()) {
-                fail(client, 408);
-            } else {
-                client.dead = true;
-            }
-        } else {
-            fail(client, 504);
-        }
-        settle(token);
+        (void)expire_client(token);
     }
+}
+
+bool Worker::expire_client(Token token) {
+    auto& client = clients_.at(token);
+    if (!client.timer || (*client.timer)->first > now_) {
+        return false;
+    }
+    if (client.linger_deadline <= now_ || client.write_deadline <= now_) {
+        client.dead = true;
+    } else if (client.header_deadline <= now_ || client.read_deadline <= now_) {
+        if (client.request.started()) {
+            fail(client, 408);
+        } else {
+            client.dead = true;
+        }
+    } else {
+        fail(client, 504);
+    }
+    settle(token);
+    return true;
 }
 
 int Worker::wait_time() const {
@@ -579,7 +614,7 @@ void Worker::assign(Token token, Client& client) {
 
     const auto& endpoint = config_.backends[client.backend].endpoint;
     const auto* address = reinterpret_cast<const sockaddr*>(&endpoint.address);
-    Fd fd(socket(address->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+    Fd fd(socket(endpoint.address.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (!fd) {
         fail(client, 502);
         return;
