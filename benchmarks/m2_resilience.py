@@ -82,7 +82,7 @@ class Connection:
             self.close()
         if status == 200 and (body != PAYLOAD or backend not in {"fast", "slow"}):
             raise ValueError("invalid successful response")
-        return status, backend
+        return status, backend, headers.get(b"x-aegisgate-rate-limit", b"").decode()
 
 
 async def fixed_rate(port, rate, seconds, concurrency):
@@ -94,7 +94,7 @@ async def fixed_rate(port, rate, seconds, concurrency):
     async def request(slot, due, launched):
         status, backend, detail = 0, "", ""
         try:
-            status, backend = await asyncio.wait_for(slot.get("/data"), 2)
+            status, backend, detail = await asyncio.wait_for(slot.get("/data"), 2)
         except (OSError, EOFError, ValueError, KeyError, IndexError, asyncio.TimeoutError,
                 asyncio.LimitOverrunError) as error:
             detail = type(error).__name__
